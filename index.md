@@ -1,20 +1,11 @@
 # Knowledge Index
 
-## Active Projects
-- projects/template-project.md
+Read this file first when answering queries.
 
-## Topics
-- Architecture
-- DevOps
-- Data Engineering
-- AI
+## Collections
 
-## Daily Logs
-- See /daily
-
-## Patterns
-- Coding patterns
-- Integration patterns
-
-## Notes
-This index is manually curated and periodically refined with AI assistance.
+- [Open tasks](wiki/collections/tasks.md) - Active tasks awaiting assignment or completion
+- [Future](wiki/collections/future.md) - Scheduled and migrated future work
+- [Timeline](wiki/collections/timeline.md) - Chronological events
+- [Ideas](wiki/collections/ideas.md) - Candidate ideas
+- [Research](wiki/collections/research.md) - Explore signifier research gaps
