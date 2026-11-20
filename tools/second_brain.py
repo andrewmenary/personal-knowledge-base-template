@@ -9,13 +9,14 @@ import html
 import json
 import re
 import sys
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("SECOND_BRAIN_ROOT", Path(__file__).resolve().parents[1])).resolve()
 RAW = ROOT / "raw"
 ASSETS = RAW / "assets"
 WIKI = ROOT / "wiki"
@@ -23,6 +24,7 @@ INBOX = ROOT / "inbox"
 INDEX = ROOT / "index.md"
 LOG = ROOT / "log.md"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg"}
+TEXT_TYPES = {"text/", "application/json", "application/xml", "application/yaml", "application/javascript"}
 COLLECTION_HEADINGS = re.compile(
     r"^#{1,3}\s+(reading list|habit tracker|shopping list|meeting notes|"
     r"project spread|personal goals|goals|collection|book list|watch list)\b",
@@ -95,6 +97,14 @@ def convert_markitdown(path: Path) -> str | None:
         return None
 
 
+def convert_markitdown_available() -> bool:
+    try:
+        __import__("markitdown")
+        return True
+    except Exception:
+        return False
+
+
 def fetch_url(url: str) -> tuple[bytes, str]:
     request = Request(url, headers={"User-Agent": "second-brain/1.0"})
     with urlopen(request, timeout=30) as response:
@@ -125,16 +135,21 @@ def ingest(source: str) -> dict[str, str]:
             suffix = suffix or ".img"
             destination = ASSETS / year / slug
             destination.mkdir(parents=True, exist_ok=True)
-            asset = destination / f"{slug}{suffix}"
+            asset = destination / f"{slug}-{sha[:12]}{suffix}"
             asset.write_bytes(data)
             body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
+            if content_type and not any(content_type.startswith(prefix) for prefix in TEXT_TYPES):
+                if not convert_markitdown_available():
+                    raise ValueError(f"Binary URL content requires MarkItDown: {source}")
             INBOX.mkdir(parents=True, exist_ok=True)
             temp = INBOX / f"_download{suffix or '.html'}"
             temp.write_bytes(data)
             converted = convert_markitdown(temp)
             temp.unlink(missing_ok=True)
             if converted is None:
+                if content_type and not any(content_type.startswith(prefix) for prefix in TEXT_TYPES):
+                    raise ValueError(f"Binary URL content could not be converted: {source}")
                 text = data.decode("utf-8", errors="replace")
                 if "html" in content_type or suffix in {".htm", ".html"}:
                     text = html.unescape(re.sub(r"<[^>]+>", " ", text))
@@ -154,9 +169,9 @@ def ingest(source: str) -> dict[str, str]:
         if path.suffix.lower() in IMAGE_SUFFIXES:
             destination = ASSETS / year / slug
             destination.mkdir(parents=True, exist_ok=True)
-            asset = destination / path.name
+            asset = destination / f"{slug}-{sha[:12]}{path.suffix.lower()}"
             asset.write_bytes(data)
-            body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{path.name})\n"
+            body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
             converted = convert_markitdown(path)
             if converted is None:
@@ -190,6 +205,19 @@ def update_index(title: str, relative_source: str):
     text = INDEX.read_text(encoding="utf-8") if INDEX.exists() else "# Knowledge Index\n"
     link = f"- [{title}]({relative_source})"
     section = "## Raw sources"
+    if link not in text:
+        if section in text:
+            text = text.replace(section, section + "\n\n" + link)
+        else:
+            text = text.rstrip() + "\n\n" + section + "\n\n" + link
+        INDEX.write_text(gfm(text), encoding="utf-8")
+
+
+def update_collection_index(name: str, destination: Path):
+    text = INDEX.read_text(encoding="utf-8") if INDEX.exists() else "# Knowledge Index\n"
+    relative = destination.relative_to(ROOT).as_posix()
+    link = f"- [{name.replace('-', ' ').title()}]({relative})"
+    section = "## Collections"
     if link not in text:
         if section in text:
             text = text.replace(section, section + "\n\n" + link)
@@ -235,24 +263,31 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
     symbol = symbols[status]
     needle = task.strip().lower()
     changed = []
-    for path in ROOT.rglob("*.md"):
-        if ".git" in path.parts or path.resolve() == LOG.resolve():
+    candidates = []
+    candidates.extend(RAW.rglob("*.md"))
+    candidates.extend((WIKI / "collections").rglob("*.md"))
+    canonical_updated = False
+    for path in sorted(set(candidates)):
+        if canonical_updated:
+            break
+        if path.resolve() == LOG.resolve():
             continue
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
         output = []
         for line in lines:
             parsed = parse_bullet(line)
-            if needle and needle in str(parsed["text"]).lower():
+            if not canonical_updated and needle and parsed["bullet"] and needle in str(parsed["text"]).lower():
                 prefix = re.match(r"^(\s*[*=!^]*)(?:\[.[^\]]*\]|[+\-XO>x<])", line)
                 prefix_text = prefix.group(1) if prefix else ""
                 replacement = f"{prefix_text}{symbol} {parsed['text']}"
                 if status == "scheduled" and date:
-                    replacement += f" ({date})"
+                    replacement = f"{prefix_text}< {date} {parsed['text']}"
                 elif status == "migrated" and target:
                     replacement += f" -> {target}"
                 output.append(replacement)
                 changed.append(path.relative_to(ROOT).as_posix())
+                canonical_updated = True
             else:
                 output.append(line)
         new_text = "\n".join(output) + ("\n" if text.endswith("\n") else "")
@@ -294,9 +329,16 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
         destination = WIKI / "collections" / f"{name}.md"
         destination.parent.mkdir(parents=True, exist_ok=True)
         existing = destination.read_text(encoding="utf-8") if destination.exists() else f"# {name.replace('-', ' ').title()}\n"
-        block = "\n".join(dict.fromkeys(entries)).strip()
+        source_relative = (
+            source.resolve().relative_to(ROOT).as_posix()
+            if source.resolve().is_relative_to(ROOT)
+            else source.as_posix()
+        )
+        annotated_entries = [f"{entry} ([source](../../{source_relative}))" for entry in dict.fromkeys(entries)]
+        block = "\n".join(annotated_entries).strip()
         if block and block not in existing:
             destination.write_text(gfm(existing.rstrip() + "\n\n" + block), encoding="utf-8")
+        update_collection_index(name, destination)
         results.append({"collection": name, "path": destination.relative_to(ROOT).as_posix()})
     if collections:
         append_log("collection", source.name, f"{len(collections)} collection(s)")
@@ -366,7 +408,12 @@ def lint_source_drift(check_urls: bool = False) -> list[dict[str, str]]:
 
 
 def lint_orphans() -> list[dict[str, str]]:
-    pages = {path.resolve() for path in WIKI.rglob("*.md")}
+    output_dir = (WIKI / "output").resolve()
+    pages = {
+        path.resolve()
+        for path in WIKI.rglob("*.md")
+        if output_dir not in path.resolve().parents
+    }
     linked = set()
     pattern = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)")
     for path in sorted(ROOT.rglob("*.md")):
@@ -384,7 +431,10 @@ def save_query_output(terms: str, matches: list[dict[str, str]]) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{slugify(terms)}-{utc_now()[:10]}.md"
     lines = [f"# Query: {terms}", "", "## Results", ""]
-    lines.extend(f"- [`{item['path']}`]({item['path']}) - {item['line']}" for item in matches)
+    lines.extend(
+        f"- [`{item['path']}`](../../{item['path']}) - {item['line']}"
+        for item in matches
+    )
     if not matches:
         lines.append("_No matching results._")
     destination.write_text(gfm("\n".join(lines)), encoding="utf-8")
