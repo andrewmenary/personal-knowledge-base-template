@@ -84,6 +84,8 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 
 Recognize reading lists, habits, shopping lists, goals, meeting notes, project spreads, and other recurring headings. Merge entries by stable identity into `wiki/collections/<slug>.md`. Preserve source links and do not treat collection entries as daily reflections.
 
+For automatic extraction, identity is the exact entry text with leading and trailing whitespace removed, including its Markdown bullet or task marker. Matching entries retain one line with a link for each source.
+
 ### OCR cleanup
 
 For photos or scans:
@@ -113,6 +115,8 @@ aliases: {}
 `python tools/second_brain.py ingest <file-or-url>`
 
 The CLI reads text directly or uses MarkItDown when available. URLs are fetched and converted. Non-image binaries are converted to Markdown and the original is not stored under `raw/`. Images are stored under `raw/assets/`.
+
+Without a successful conversion, local text fallback accepts extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files, provided their UTF-8 content has no binary control characters.
 
 ### Query
 

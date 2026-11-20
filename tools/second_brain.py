@@ -12,7 +12,7 @@ import sys
 import os
 from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 import yaml
@@ -27,6 +27,7 @@ INDEX = ROOT / "index.md"
 LOG = ROOT / "log.md"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg"}
 TEXT_TYPES = {"text/", "application/json", "application/xml", "application/yaml", "application/javascript"}
+TEXT_SUFFIXES = {"", ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".html", ".htm"}
 COLLECTION_HEADINGS = re.compile(
     r"^#{1,3}\s+(reading list|habit tracker|shopping list|meeting notes|"
     r"project spread|personal goals|goals|collection|book list|watch list)\b",
@@ -179,9 +180,13 @@ def ingest(source: str) -> dict[str, str]:
         else:
             converted = convert_markitdown(path)
             if converted is None:
+                if path.suffix.lower() not in TEXT_SUFFIXES or data.startswith((b"%PDF-", b"PK\x03\x04")):
+                    raise ValueError(f"Binary source requires MarkItDown: {path}")
                 try:
-                    converted = path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
+                    converted = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"Binary source requires MarkItDown: {path}") from exc
+                if any(ord(char) < 32 and char not in "\t\r\n" for char in converted) or "\x7f" in converted:
                     raise ValueError(f"Binary source requires MarkItDown: {path}")
             body = converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
 
@@ -319,7 +324,7 @@ def clean_ocr(text: str, aliases: dict[str, str] | None = None) -> str:
     text = re.sub(r" {2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     for shorthand, expansion in sorted((aliases or {}).items(), key=lambda item: -len(item[0])):
-        text = re.sub(rf"\b{re.escape(shorthand)}\b", expansion, text, flags=re.I)
+        text = re.sub(rf"\b{re.escape(shorthand)}\b", lambda _match: expansion, text, flags=re.I)
     return gfm(text)
 
 
@@ -347,10 +352,34 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
         destination.parent.mkdir(parents=True, exist_ok=True)
         existing = destination.read_text(encoding="utf-8") if destination.exists() else f"# {name.replace('-', ' ').title()}\n"
         source_relative = resolved_source.relative_to(ROOT.resolve()).as_posix()
-        annotated_entries = [f"{entry} ([source](../../{source_relative}))" for entry in dict.fromkeys(entries)]
-        block = "\n".join(annotated_entries).strip()
-        if block and block not in existing:
-            destination.write_text(gfm(existing.rstrip() + "\n\n" + block), encoding="utf-8")
+        source_annotation = f"([source](../../{quote(source_relative, safe='/')}))"
+        lines = []
+        provenance = re.compile(r"(?:\s+\(\[source\]\([^)]+\)\))+$")
+        annotation = re.compile(r"\(\[source\]\([^)]+\)\)")
+        identities = {}
+        for line in existing.splitlines():
+            identity = provenance.sub("", line).strip()
+            if identity and not identity.startswith("#"):
+                if identity in identities:
+                    index = identities[identity]
+                    for link in annotation.findall(line):
+                        if link not in lines[index]:
+                            lines[index] += f" {link}"
+                    continue
+                identities[identity] = len(lines)
+            lines.append(line)
+        for entry in entries:
+            identity = entry.strip()
+            if identity in identities:
+                index = identities[identity]
+                if source_annotation not in lines[index]:
+                    lines[index] += f" {source_annotation}"
+            else:
+                identities[identity] = len(lines)
+                lines.append(f"{entry} {source_annotation}")
+        updated = gfm("\n".join(lines))
+        if updated != existing:
+            destination.write_text(updated, encoding="utf-8")
         update_collection_index(name, destination)
         results.append({"collection": name, "path": destination.relative_to(ROOT).as_posix()})
     if collections:
@@ -392,7 +421,7 @@ def lint_links() -> list[dict[str, str]]:
             for target in pattern.findall(line):
                 if target.startswith(("http://", "https://", "mailto:", "#")):
                     continue
-                target = target.split("#", 1)[0]
+                target = unquote(target.split("#", 1)[0])
                 if target and not (path.parent / target).resolve().exists():
                     issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line_number), "target": target})
     return issues

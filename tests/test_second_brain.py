@@ -152,7 +152,8 @@ class ReviewRegressionTests(unittest.TestCase):
         self.wiki.mkdir()
         patcher = patch.multiple(
             second_brain, ROOT=self.root, RAW=self.raw, WIKI=self.wiki,
-            LOG=self.root / "log.md",
+            LOG=self.root / "log.md", INDEX=self.root / "index.md",
+            ASSETS=self.raw / "assets",
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -220,6 +221,67 @@ class ReviewRegressionTests(unittest.TestCase):
         issues = lint_source_drift()
         self.assertEqual({issue["path"] for issue in issues}, {f"raw/{name}" for name in cases if name != "valid.md"})
         self.assertTrue(all(issue["issue"] for issue in issues))
+
+    def test_binary_local_fallback_requires_conversion(self):
+        samples = {
+            "document.pdf": b"%PDF-1.0\nplain text",
+            "data.bin": b"valid utf-8",
+            "document.txt": b"hello\x00world",
+            "disguised.md": b"%PDF-1.0\nplain text",
+        }
+        with patch.object(second_brain, "convert_markitdown", return_value=None):
+            for name, data in samples.items():
+                with self.subTest(name=name):
+                    source = self.root / name
+                    source.write_bytes(data)
+                    with self.assertRaisesRegex(ValueError, "requires MarkItDown"):
+                        second_brain.ingest(str(source))
+                    self.assertEqual(list(self.raw.rglob("*.md")), [])
+            source = self.root / "notes.txt"
+            source.write_text("A normal note\n", encoding="utf-8")
+            result = second_brain.ingest(str(source))
+            self.assertIn("A normal note", (self.root / result["raw"]).read_text(encoding="utf-8"))
+        with patch.object(second_brain, "convert_markitdown", return_value="# Converted PDF"):
+            result = second_brain.ingest(str(self.root / "document.pdf"))
+            self.assertIn("Converted PDF", (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_ocr_alias_expansion_is_literal(self):
+        self.assertEqual(clean_ocr("See loc and ref", {"loc": r"C:\temp\notes", "ref": r"\1\g<name>"}),
+                         "See C:\\temp\\notes and \\1\\g<name>\n")
+        self.assertEqual(clean_ocr("reference", {"reference": r"\g<name>\q"}), r"\g<name>\q" + "\n")
+
+    def test_collection_deduplicates_and_preserves_each_source(self):
+        first = self.raw / "first note.md"
+        second = self.raw / "second.md"
+        first.write_text("# Reading List\n\n- Shared book\n- First book\n", encoding="utf-8")
+        second.write_text("# Reading List\n\n- Shared book\n- Second book\n", encoding="utf-8")
+        extract_collections(first)
+        extract_collections(second)
+        destination = self.wiki / "collections" / "reading-list.md"
+        before = destination.read_text(encoding="utf-8")
+        extract_collections(first)
+        extract_collections(second)
+        self.assertEqual(destination.read_text(encoding="utf-8"), before)
+        shared = [line for line in before.splitlines() if line.startswith("- Shared book")]
+        self.assertEqual(len(shared), 1)
+        self.assertIn("([source](../../raw/first%20note.md))", shared[0])
+        self.assertIn("([source](../../raw/second.md))", shared[0])
+        self.assertIn("- First book", before)
+        self.assertIn("- Second book", before)
+        self.assertEqual(lint_links(), [])
+
+    def test_collection_merges_preexisting_duplicate_entries(self):
+        source = self.raw / "third.md"
+        source.write_text("# Reading List\n\n- Shared\n", encoding="utf-8")
+        destination = self.wiki / "collections" / "reading-list.md"
+        destination.parent.mkdir()
+        destination.write_text("# Reading List\n\n- Shared ([source](../../raw/first.md))\n"
+                               "- Shared ([source](../../raw/second.md))\n", encoding="utf-8")
+        extract_collections(source)
+        entries = [line for line in destination.read_text(encoding="utf-8").splitlines() if line.startswith("- Shared")]
+        self.assertEqual(len(entries), 1)
+        for name in ("first", "second", "third"):
+            self.assertIn(f"../../raw/{name}.md", entries[0])
 
 
 if __name__ == "__main__":
