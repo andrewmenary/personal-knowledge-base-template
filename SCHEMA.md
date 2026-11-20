@@ -130,9 +130,11 @@ Read `index.md`, search relevant wiki pages, and synthesize answers with source 
 
 Lint broken GFM links, orphan wiki pages, missing raw sources, source hash drift, and stale front matter. URL drift is opt-in with `--check-urls`.
 
+Link lint checks inline links, images, and defined reference links; it reports undefined full and collapsed references. Undefined shortcut references are plain text in Markdown and are not reported.
+
 ## Implementation decisions
 
-- Python and PyYAML are required for tooling and YAML validation.
+- Python, PyYAML, and markdown-it-py are required for tooling, YAML validation, and Markdown link parsing.
 - MarkItDown is optional.
 - Entry point: `python tools/second_brain.py`.
 - Compatibility entry point: `python second_brain.py`.

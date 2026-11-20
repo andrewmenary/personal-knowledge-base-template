@@ -43,7 +43,7 @@ You can also request `/ingest`, `/query`, `/lint`, or `/log` by name in your pro
 
 ## Manual CLI
 
-Install the required YAML parser and optional MarkItDown conversion support:
+Install the required YAML and Markdown parsers and optional MarkItDown conversion support:
 
 ```sh
 pip install -r requirements.txt

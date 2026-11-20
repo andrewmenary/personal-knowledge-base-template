@@ -13,10 +13,11 @@ import os
 import xml.etree.ElementTree as ET
 from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
 import yaml
+from markdown_it import MarkdownIt
 
 
 ROOT = Path(os.environ.get("SECOND_BRAIN_ROOT", Path(__file__).resolve().parents[1])).resolve()
@@ -131,7 +132,7 @@ def image_extension(data: bytes) -> str:
     if data.startswith((b"II*\x00", b"MM\x00*")):
         return ".tiff"
     try:
-        if ET.fromstring(data).tag == "{http://www.w3.org/2000/svg}svg":
+        if ET.fromstring(data).tag in {"svg", "{http://www.w3.org/2000/svg}svg"}:
             return ".svg"
     except ET.ParseError:
         pass
@@ -434,19 +435,52 @@ def query_terms(terms: str) -> list[dict[str, str]]:
     return matches
 
 
+def markdown_links(text: str):
+    """Yield parsed links and explicit unresolved references with their block line."""
+    parser = MarkdownIt("commonmark")
+    environment = {}
+    tokens = parser.parse(text, environment)
+    unresolved = re.compile(r"(?<!\\)!?\[([^\[\]\n]+)\]\[([^\[\]\n]*)\]")
+    for token in tokens:
+        if token.type != "inline" or not token.children:
+            continue
+        line = (token.map[0] + 1) if token.map else 1
+        inside_link = False
+        for child in token.children:
+            if child.type == "link_open":
+                inside_link = True
+                yield line, child.attrGet("href"), False
+            elif child.type == "link_close":
+                inside_link = False
+            elif child.type == "image":
+                yield line, child.attrGet("src"), False
+            elif child.type == "text" and not inside_link:
+                for match in unresolved.finditer(child.content):
+                    raw = match.group(0)
+                    if any(candidate.group(0) == raw for candidate in unresolved.finditer(token.content)):
+                        yield line, match.group(2) or match.group(1), True
+
+
+def local_link_target(path: Path, target: str) -> Path | None:
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or not parsed.path:
+        return None
+    return (path.parent / unquote(parsed.path)).resolve()
+
+
 def lint_links() -> list[dict[str, str]]:
     issues = []
-    pattern = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)")
     for path in sorted(ROOT.rglob("*.md")):
         if ".git" in path.parts:
             continue
-        for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            for target in pattern.findall(line):
-                if target.startswith(("http://", "https://", "mailto:", "#")):
-                    continue
-                target = unquote(target.split("#", 1)[0])
-                if target and not (path.parent / target).resolve().exists():
-                    issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line_number), "target": target})
+        for line, target, undefined in markdown_links(path.read_text(encoding="utf-8", errors="replace")):
+            if undefined:
+                issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line),
+                               "target": target, "issue": "undefined reference"})
+            else:
+                resolved = local_link_target(path, target)
+                if resolved is not None and not resolved.exists():
+                    issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line), "target": target})
     return issues
 
 
@@ -522,14 +556,14 @@ def lint_orphans() -> list[dict[str, str]]:
         if output_dir not in path.resolve().parents
     }
     linked = set()
-    pattern = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)")
     for path in sorted(ROOT.rglob("*.md")):
         if ".git" in path.parts:
             continue
-        for target in pattern.findall(path.read_text(encoding="utf-8", errors="replace")):
-            if target.startswith(("http://", "https://", "#")):
-                continue
-            linked.add((path.parent / target.split("#", 1)[0]).resolve())
+        for _, target, undefined in markdown_links(path.read_text(encoding="utf-8", errors="replace")):
+            if not undefined:
+                resolved = local_link_target(path, target)
+                if resolved is not None:
+                    linked.add(resolved)
     return [{"path": path.relative_to(ROOT).as_posix()} for path in sorted(pages) if path not in linked and path.name != "README.md"]
 
 

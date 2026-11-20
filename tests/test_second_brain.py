@@ -296,6 +296,52 @@ class ReviewRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "image format"):
                 second_brain.ingest("https://example.com/broken")
 
+    def test_svg_roots_with_and_without_namespace(self):
+        for data in (b"<svg><path/></svg>",
+                     b'<svg xmlns="http://www.w3.org/2000/svg"><path/></svg>'):
+            with self.subTest(data=data):
+                with patch.object(second_brain, "fetch_url", return_value=(data, "image/svg+xml")):
+                    result = second_brain.ingest("https://example.com/image")
+                raw = (self.root / result["raw"]).read_text(encoding="utf-8")
+                self.assertIn(".svg)", raw)
+                self.assertTrue(any(path.suffix == ".svg" and path.read_bytes() == data
+                                    for path in (self.raw / "assets").rglob("*") if path.is_file()))
+        with self.assertRaises(ValueError):
+            second_brain.image_extension(b"<html/>")
+
+    def test_markdown_links_references_and_orphan_detection(self):
+        (self.root / "some file.md").write_text("# File\n", encoding="utf-8")
+        (self.root / "balanced (name).md").write_text("# File\n", encoding="utf-8")
+        (self.wiki / "linked.md").write_text("# Linked\n", encoding="utf-8")
+        (self.root / "picture.png").write_bytes(b"image")
+        (self.root / "index.md").write_text(
+            '[angle](<some file.md> "title")\n'
+            '[nested](balanced%20(name).md)\n'
+            '[reference][PAGE] ![image][pic]\n'
+            '[bad inline](missing.md) [bad ref][absent]\n'
+            '[external](https://example.com) [anchor](#section)\n'
+            '`[code](missing-code.md)`\n'
+            r'\[escaped][no-reference]' + '\n'
+            '\n[page]: wiki/linked.md\n[pic]: picture.png\n',
+            encoding="utf-8",
+        )
+        issues = lint_links()
+        self.assertEqual({issue["target"] for issue in issues}, {"missing.md", "absent"})
+        self.assertIn("undefined reference", {issue.get("issue") for issue in issues})
+        self.assertEqual(lint_orphans(), [])
+
+    def test_broken_reference_destinations_and_collapsed_references(self):
+        (self.root / "index.md").write_text(
+            '[broken][label] ![icon][] [missing label][] ![other][unknown]\n'
+            '\n[label]: <missing file.md>\n[icon]: missing.png\n',
+            encoding="utf-8",
+        )
+        issues = lint_links()
+        self.assertEqual(
+            {issue["target"] for issue in issues},
+            {"missing%20file.md", "missing.png", "missing label", "unknown"},
+        )
+
     def test_binary_local_fallback_requires_conversion(self):
         samples = {
             "document.pdf": b"%PDF-1.0\nplain text",
