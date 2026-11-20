@@ -77,7 +77,7 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 2. Mark completed tasks `X`.
 3. Mark irrelevant tasks with `~~strikethrough~~`.
 4. Change relevant tasks to `>` and point to a collection or future log.
-5. Change date-bound tasks to `< YYYY-MM-DD`.
+5. Change date-bound tasks to `< YYYY-MM-DD`; scheduled migrations require a valid calendar date.
 6. Preserve one canonical task record; historical dates may cite it.
 
 ### Collections
@@ -124,7 +124,7 @@ Lint broken GFM links, orphan wiki pages, missing raw sources, source hash drift
 
 ## Implementation decisions
 
-- Python standard library is the required runtime.
+- Python and PyYAML are required for tooling and YAML validation.
 - MarkItDown is optional.
 - Entry point: `python tools/second_brain.py`.
 - Compatibility entry point: `python second_brain.py`.

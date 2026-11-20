@@ -10,10 +10,12 @@ import json
 import re
 import sys
 import os
-from datetime import datetime, timezone
+from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+import yaml
 
 
 ROOT = Path(os.environ.get("SECOND_BRAIN_ROOT", Path(__file__).resolve().parents[1])).resolve()
@@ -73,18 +75,20 @@ def front_matter(title: str, source: str, source_type: str, source_sha256: str) 
     return "\n".join(lines)
 
 
-def parse_front_matter(text: str) -> dict[str, str]:
-    if not text.startswith("---\n"):
-        return {}
-    end = text.find("\n---", 4)
-    if end < 0:
-        return {}
-    result = {}
-    for line in text[4:end].splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        result[key.strip()] = value.strip().strip('"')
+def parse_front_matter(text: str) -> dict:
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise ValueError("missing YAML front matter")
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        raise ValueError("unterminated YAML front matter") from None
+    try:
+        result = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"malformed YAML front matter: {exc}") from exc
+    if not isinstance(result, dict):
+        raise ValueError("YAML front matter must be a mapping")
     return result
 
 
@@ -261,6 +265,13 @@ def route_bullet(line: str) -> str:
 def migrate_task(task: str, status: str, target: str | None = None, date: str | None = None) -> list[str]:
     symbols = {"open": "+", "completed": "X", "migrated": ">", "scheduled": "<"}
     symbol = symbols[status]
+    if status == "scheduled":
+        if not date or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            raise ValueError("scheduled tasks require a valid date in YYYY-MM-DD format")
+        try:
+            calendar_date.fromisoformat(date)
+        except ValueError:
+            raise ValueError("scheduled tasks require a valid date in YYYY-MM-DD format") from None
     needle = task.strip().lower()
     changed = []
     candidates = []
@@ -277,12 +288,15 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
         output = []
         for line in lines:
             parsed = parse_bullet(line)
-            if not canonical_updated and needle and parsed["bullet"] and needle in str(parsed["text"]).lower():
-                prefix = re.match(r"^(\s*[*=!^]*)(?:\[.[^\]]*\]|[+\-XO>x<])", line)
-                prefix_text = prefix.group(1) if prefix else ""
-                replacement = f"{prefix_text}{symbol} {parsed['text']}"
-                if status == "scheduled" and date:
-                    replacement = f"{prefix_text}< {date} {parsed['text']}"
+            if not canonical_updated and needle and parsed["bullet"] in {" ", "+", ">", "<", "X", "x"} and needle in str(parsed["text"]).lower():
+                match = re.match(r"^([ \t]*(?:[*=!^][ \t]*)*)(\[[ Xx><]\]|[+Xx><])", line)
+                if match is None:
+                    output.append(line)
+                    continue
+                marker = f"[{symbol if symbol != '+' else ' '}]" if match.group(2).startswith("[") else symbol
+                replacement = match.group(1) + marker + line[match.end():]
+                if status == "scheduled":
+                    replacement = match.group(1) + marker + " " + date + line[match.end():]
                 elif status == "migrated" and target:
                     replacement += f" -> {target}"
                 output.append(replacement)
@@ -387,10 +401,20 @@ def lint_links() -> list[dict[str, str]]:
 def lint_source_drift(check_urls: bool = False) -> list[dict[str, str]]:
     issues = []
     for path in sorted(RAW.rglob("*.md")):
-        meta = parse_front_matter(path.read_text(encoding="utf-8", errors="replace"))
-        source, expected = meta.get("source"), meta.get("source_sha256")
-        if not source or not expected:
+        relative = path.relative_to(ROOT).as_posix()
+        try:
+            meta = parse_front_matter(path.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            issues.append({"path": relative, "issue": str(exc)})
             continue
+        source, expected = meta.get("source"), meta.get("source_sha256")
+        if not isinstance(source, str) or not source.strip() or "\0" in source:
+            issues.append({"path": relative, "issue": "missing or invalid source metadata"})
+            continue
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            issues.append({"path": relative, "issue": "missing or invalid source_sha256 metadata"})
+            continue
+        expected = expected.lower()
         parsed = urlparse(source)
         if parsed.scheme in {"http", "https"}:
             if check_urls:

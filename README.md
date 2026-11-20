@@ -22,7 +22,7 @@ python tools/second_brain.py query "term"
 python tools/second_brain.py lint
 ```
 
-Optional MarkItDown support:
+Install the required YAML parser and optional MarkItDown conversion support:
 
 ```sh
 pip install -r requirements.txt

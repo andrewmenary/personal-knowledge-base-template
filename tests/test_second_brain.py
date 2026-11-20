@@ -2,7 +2,12 @@ import subprocess
 import tempfile
 import unittest
 import os
+import hashlib
+import sys
 from pathlib import Path
+from unittest.mock import patch
+
+from tools import second_brain
 
 from tools.second_brain import (
     ROOT,
@@ -134,6 +139,87 @@ class SecondBrainTests(unittest.TestCase):
         self.assertIsInstance(lint_links(), list)
         self.assertIsInstance(lint_source_drift(), list)
         self.assertIsInstance(lint_orphans(), list)
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.raw = self.root / "raw"
+        self.raw.mkdir()
+        self.wiki = self.root / "wiki"
+        self.wiki.mkdir()
+        patcher = patch.multiple(
+            second_brain, ROOT=self.root, RAW=self.raw, WIKI=self.wiki,
+            LOG=self.root / "log.md",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_migration_preserves_indent_and_signifiers(self):
+        for original, expected in (
+            ("* + priority task\n", "* X priority task\n"),
+            ("! [ ] idea task\n", "! [X] idea task\n"),
+            ("  \t*  =  + indented task\n", "  \t*  =  X indented task\n"),
+            ("  + indented task\n", "  X indented task\n"),
+        ):
+            with self.subTest(original=original):
+                source = self.raw / "journal.md"
+                source.write_text(original, encoding="utf-8")
+                migrate_task("task", "completed")
+                self.assertEqual(source.read_text(encoding="utf-8"), expected)
+
+    def test_scheduled_date_validation_before_any_write(self):
+        source = self.raw / "journal.md"
+        original = "  * [ ] schedule task\n"
+        source.write_text(original, encoding="utf-8")
+        for invalid in (None, "", "2026-2-03", "2026-02-29", "tomorrow", "2026-02-30"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "valid date"):
+                    migrate_task("schedule task", "scheduled", date=invalid)
+                self.assertEqual(source.read_text(encoding="utf-8"), original)
+                self.assertFalse((self.root / "log.md").exists())
+        migrate_task("schedule task", "scheduled", date="2028-02-29")
+        self.assertEqual(source.read_text(encoding="utf-8"), "  * [<] 2028-02-29 schedule task\n")
+
+    def test_scheduled_cli_rejects_missing_and_invalid_date(self):
+        source = self.raw / "journal.md"
+        original = "+ schedule task\n"
+        source.write_text(original, encoding="utf-8")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        for date_args in ([], ["--date", "2026-02-30"]):
+            with self.subTest(date_args=date_args):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "tools" / "second_brain.py"),
+                     "migrate", "schedule task", "scheduled", *date_args],
+                    env=env, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("valid date", result.stderr)
+                self.assertEqual(source.read_text(encoding="utf-8"), original)
+                self.assertFalse((self.root / "log.md").exists())
+
+    def test_lint_reports_missing_or_malformed_source_metadata(self):
+        digest = hashlib.sha256(b"original").hexdigest()
+        source = self.root / "source.txt"
+        source.write_bytes(b"original")
+        cases = {
+            "missing.md": "# No front matter\n",
+            "unclosed.md": "---\nsource: example\n",
+            "malformed.md": '---\nsource: "unterminated\n---\n',
+            "nonmapping.md": "---\n- entry\n---\n",
+            "empty-source.md": f"---\nsource: null\nsource_sha256: '{digest}'\n---\n",
+            "missing-hash.md": f"---\nsource: '{source.as_posix()}'\n---\n",
+            "bad-hash.md": f"---\nsource: '{source.as_posix()}'\nsource_sha256: bad\n---\n",
+            "valid.md": f"---\nsource: '{source.as_posix()}'\nsource_sha256: '{digest}'\n---\n",
+        }
+        for name, text in cases.items():
+            (self.raw / name).write_text(text, encoding="utf-8")
+        issues = lint_source_drift()
+        self.assertEqual({issue["path"] for issue in issues}, {f"raw/{name}" for name in cases if name != "valid.md"})
+        self.assertTrue(all(issue["issue"] for issue in issues))
 
 
 if __name__ == "__main__":
