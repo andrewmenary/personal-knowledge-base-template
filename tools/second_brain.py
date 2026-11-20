@@ -311,6 +311,9 @@ def clean_ocr(text: str, aliases: dict[str, str] | None = None) -> str:
 
 def extract_collections(source: Path) -> list[dict[str, str]]:
     text = source.read_text(encoding="utf-8")
+    resolved_source = source.resolve()
+    if not resolved_source.is_relative_to(ROOT.resolve()):
+        raise ValueError(f"Collection source must be inside the knowledge base: {source}")
     collections: dict[str, list[str]] = {}
     current = None
     for line in text.splitlines():
@@ -329,11 +332,7 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
         destination = WIKI / "collections" / f"{name}.md"
         destination.parent.mkdir(parents=True, exist_ok=True)
         existing = destination.read_text(encoding="utf-8") if destination.exists() else f"# {name.replace('-', ' ').title()}\n"
-        source_relative = (
-            source.resolve().relative_to(ROOT).as_posix()
-            if source.resolve().is_relative_to(ROOT)
-            else source.as_posix()
-        )
+        source_relative = resolved_source.relative_to(ROOT.resolve()).as_posix()
         annotated_entries = [f"{entry} ([source](../../{source_relative}))" for entry in dict.fromkeys(entries)]
         block = "\n".join(annotated_entries).strip()
         if block and block not in existing:
@@ -343,6 +342,11 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
     if collections:
         append_log("collection", source.name, f"{len(collections)} collection(s)")
     return results
+
+
+def collection_source_candidates() -> list[Path]:
+    candidates = [*RAW.rglob("*.md"), *INBOX.glob("*")]
+    return [path for path in candidates if path.is_file() and path.suffix.lower() in {".md", ".txt"}]
 
 
 def query_terms(terms: str) -> list[dict[str, str]]:
@@ -522,11 +526,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "extract-collections":
-            candidates = [Path(args.source)] if args.source else [
-                *RAW.rglob("*.md"),
-                *INBOX.glob("*"),
-                *WIKI.rglob("*.md"),
-            ]
+            candidates = [Path(args.source)] if args.source else collection_source_candidates()
             results = []
             for candidate in candidates:
                 if candidate.is_file() and candidate.suffix.lower() in {".md", ".txt"}:

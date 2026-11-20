@@ -8,6 +8,7 @@ from tools.second_brain import (
     ROOT,
     RAW,
     WIKI,
+    collection_source_candidates,
     clean_ocr,
     extract_collections,
     lint_links,
@@ -117,6 +118,17 @@ class SecondBrainTests(unittest.TestCase):
             self.assertIn("](../../wiki/collections/tasks.md)", text)
         finally:
             output.unlink(missing_ok=True)
+
+    def test_external_collection_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "note.md"
+            source.write_text("# Reading List\n\n- External book\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                extract_collections(source)
+
+    def test_automatic_collection_candidates_exclude_wiki(self):
+        candidates = collection_source_candidates()
+        self.assertFalse(any(path.is_relative_to(WIKI) for path in candidates))
 
     def test_lint_helpers(self):
         self.assertIsInstance(lint_links(), list)
