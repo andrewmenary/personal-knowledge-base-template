@@ -30,6 +30,8 @@ immutable: true
 ---
 ```
 
+`title`, `source`, `source_type` (`file` or `url`), `ingested_at` (a timezone-aware ISO timestamp), `source_sha256` (64 hexadecimal digits), `tags` (a list of strings), `status` (a nonempty string), and `immutable` (`true`) are required.
+
 Generated Markdown is GitHub-Flavored Markdown (GFM).
 
 ## Raw source immutability
@@ -116,11 +118,13 @@ aliases: {}
 
 The CLI reads text directly or uses MarkItDown when available. URLs are fetched and converted. Non-image binaries are converted to Markdown and the original is not stored under `raw/`. Images are stored under `raw/assets/`.
 
+Image file extensions are derived from supported image content, not a URL suffix. Unsupported or unrecognized image formats are rejected.
+
 Without a successful conversion, local text fallback accepts extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files, provided their UTF-8 content has no binary control characters.
 
 ### Query
 
-Read `index.md`, search relevant wiki pages, and synthesize answers with source links. Optional output goes to `wiki/output/`.
+Read `index.md`, search relevant wiki pages, and synthesize answers with source links. Optional output goes to `wiki/output/`. The CLI appends one query operation to `log.md` whether or not output is saved.
 
 ### Lint
 

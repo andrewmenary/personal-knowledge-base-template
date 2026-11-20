@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import os
+import xml.etree.ElementTree as ET
 from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -116,6 +117,27 @@ def fetch_url(url: str) -> tuple[bytes, str]:
         return response.read(), response.headers.get_content_type() or "application/octet-stream"
 
 
+def image_extension(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tiff"
+    try:
+        if ET.fromstring(data).tag == "{http://www.w3.org/2000/svg}svg":
+            return ".svg"
+    except ET.ParseError:
+        pass
+    raise ValueError("Unrecognized or unsupported image format")
+
+
 def append_log(operation: str, title: str, detail: str = ""):
     if not LOG.exists():
         LOG.write_text("# Operations Log\n", encoding="utf-8")
@@ -137,7 +159,7 @@ def ingest(source: str) -> dict[str, str]:
         sha = hashlib.sha256(data).hexdigest()
         slug = slugify(title)
         if suffix in IMAGE_SUFFIXES or "image/" in content_type:
-            suffix = suffix or ".img"
+            suffix = image_extension(data)
             destination = ASSETS / year / slug
             destination.mkdir(parents=True, exist_ok=True)
             asset = destination / f"{slug}-{sha[:12]}{suffix}"
@@ -172,9 +194,10 @@ def ingest(source: str) -> dict[str, str]:
         title = re.sub(r"[-_]+", " ", path.stem).strip().title() or "Untitled"
         slug = slugify(title)
         if path.suffix.lower() in IMAGE_SUFFIXES:
+            suffix = image_extension(data)
             destination = ASSETS / year / slug
             destination.mkdir(parents=True, exist_ok=True)
-            asset = destination / f"{slug}-{sha[:12]}{path.suffix.lower()}"
+            asset = destination / f"{slug}-{sha[:12]}{suffix}"
             asset.write_bytes(data)
             body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
@@ -436,16 +459,43 @@ def lint_source_drift(check_urls: bool = False) -> list[dict[str, str]]:
         except (ValueError, UnicodeDecodeError) as exc:
             issues.append({"path": relative, "issue": str(exc)})
             continue
+        for field in ("title", "source", "source_type", "status"):
+            value = meta.get(field)
+            if not isinstance(value, str) or not value.strip() or "\0" in value:
+                issues.append({"path": relative, "issue": f"missing or invalid {field} metadata"})
+        if not isinstance(meta.get("source_type"), str) or meta["source_type"] not in {"file", "url"}:
+            issues.append({"path": relative, "issue": "source_type must be file or url"})
+        if not isinstance(meta.get("tags"), list) or not all(isinstance(tag, str) for tag in meta["tags"]):
+            issues.append({"path": relative, "issue": "tags must be a list of strings"})
+        if meta.get("immutable") is not True:
+            issues.append({"path": relative, "issue": "immutable must be true"})
+        timestamp = meta.get("ingested_at")
+        try:
+            parsed_time = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+                raise ValueError("timestamp requires timezone")
+        except (ValueError, TypeError, AttributeError):
+            issues.append({"path": relative, "issue": "missing or invalid ingested_at timestamp"})
         source, expected = meta.get("source"), meta.get("source_sha256")
         if not isinstance(source, str) or not source.strip() or "\0" in source:
-            issues.append({"path": relative, "issue": "missing or invalid source metadata"})
             continue
         if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
             issues.append({"path": relative, "issue": "missing or invalid source_sha256 metadata"})
             continue
         expected = expected.lower()
-        parsed = urlparse(source)
-        if parsed.scheme in {"http", "https"}:
+        try:
+            parsed = urlparse(source)
+        except ValueError:
+            issues.append({"path": relative, "issue": "invalid source location"})
+            continue
+        is_url = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        if meta.get("source_type") == "url" and not is_url:
+            issues.append({"path": relative, "issue": "URL source must be an absolute HTTP(S) URL"})
+            continue
+        if meta.get("source_type") == "file" and is_url:
+            issues.append({"path": relative, "issue": "file source must not be an HTTP(S) URL"})
+            continue
+        if is_url:
             if check_urls:
                 try:
                     data, _ = fetch_url(source)
@@ -495,7 +545,6 @@ def save_query_output(terms: str, matches: list[dict[str, str]]) -> Path:
     if not matches:
         lines.append("_No matching results._")
     destination.write_text(gfm("\n".join(lines)), encoding="utf-8")
-    append_log("query", terms, f"[{destination.relative_to(ROOT).as_posix()}]")
     return destination
 
 
@@ -545,10 +594,13 @@ def main(argv: list[str] | None = None) -> int:
             matches = query_terms(terms)
             if args.save:
                 output = save_query_output(terms, matches)
+                append_log("query", terms, f"[{output.relative_to(ROOT).as_posix()}]")
                 print(json.dumps({"output": output.relative_to(ROOT).as_posix(), "matches": matches}, indent=2) if args.json else f"Saved: {output.relative_to(ROOT).as_posix()}")
             elif args.json:
+                append_log("query", terms)
                 print(json.dumps(matches, indent=2))
             else:
+                append_log("query", terms)
                 if not matches:
                     print("No matches.")
                 for match in matches:

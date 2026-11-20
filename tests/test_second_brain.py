@@ -11,8 +11,6 @@ from tools import second_brain
 
 from tools.second_brain import (
     ROOT,
-    RAW,
-    WIKI,
     collection_source_candidates,
     clean_ocr,
     extract_collections,
@@ -28,12 +26,23 @@ from tools.second_brain import (
 
 class SecondBrainTests(unittest.TestCase):
     def setUp(self):
-        self.index_before = (ROOT / "index.md").read_text(encoding="utf-8")
-        self.log_before = (ROOT / "log.md").read_text(encoding="utf-8")
-
-    def tearDown(self):
-        (ROOT / "index.md").write_text(self.index_before, encoding="utf-8")
-        (ROOT / "log.md").write_text(self.log_before, encoding="utf-8")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.raw = self.root / "raw"
+        self.wiki = self.root / "wiki"
+        self.raw.mkdir()
+        (self.wiki / "collections").mkdir(parents=True)
+        (self.wiki / "concepts.md").write_text("# Concepts\n", encoding="utf-8")
+        (self.root / "index.md").write_text("# Knowledge Index\n", encoding="utf-8")
+        (self.root / "log.md").write_text("# Operations Log\n", encoding="utf-8")
+        patcher = patch.multiple(
+            second_brain, ROOT=self.root, RAW=self.raw, WIKI=self.wiki,
+            LOG=self.root / "log.md", INDEX=self.root / "index.md",
+            ASSETS=self.raw / "assets", INBOX=self.root / "inbox",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_bullet_routes(self):
         self.assertEqual(route_bullet("+ Ship release"), "wiki/collections/tasks.md")
@@ -50,7 +59,7 @@ class SecondBrainTests(unittest.TestCase):
         self.assertIn("meeting", cleaned)
 
     def test_migration_updates_in_place(self):
-        path = RAW / "migration-test.md"
+        path = self.raw / "migration-test.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("+ Migrate this task\n", encoding="utf-8")
         try:
@@ -60,7 +69,7 @@ class SecondBrainTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-        scheduled = RAW / "scheduled-test.md"
+        scheduled = self.raw / "scheduled-test.md"
         scheduled.write_text("+ Schedule this task\n", encoding="utf-8")
         try:
             migrate_task("Schedule this task", "scheduled", date="2026-12-01")
@@ -69,7 +78,7 @@ class SecondBrainTests(unittest.TestCase):
             scheduled.unlink(missing_ok=True)
 
     def test_migration_ignores_plain_prose(self):
-        path = RAW / "plain-test.md"
+        path = self.raw / "plain-test.md"
         path.write_text("# Release\n\nWe need to release soon.\n", encoding="utf-8")
         try:
             changed = migrate_task("release", "completed")
@@ -100,21 +109,19 @@ class SecondBrainTests(unittest.TestCase):
             self.assertIn("raw/", result.stdout)
 
     def test_collection_has_source_and_index_entry(self):
-        source = RAW / "reading-test.md"
+        source = self.raw / "reading-test.md"
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text("# Reading List\n\n- A useful book\n", encoding="utf-8")
-        destination = WIKI / "collections" / "reading-list.md"
-        index_before = (ROOT / "index.md").read_text(encoding="utf-8")
+        destination = self.wiki / "collections" / "reading-list.md"
         try:
             results = extract_collections(source)
             self.assertTrue(results)
             collection_text = destination.read_text(encoding="utf-8")
             self.assertIn("[source](../../raw/reading-test.md)", collection_text)
-            self.assertIn("(wiki/collections/reading-list.md)", (ROOT / "index.md").read_text(encoding="utf-8"))
+            self.assertIn("(wiki/collections/reading-list.md)", (self.root / "index.md").read_text(encoding="utf-8"))
         finally:
             source.unlink(missing_ok=True)
             destination.unlink(missing_ok=True)
-            (ROOT / "index.md").write_text(index_before, encoding="utf-8")
 
     def test_saved_query_links_are_relative(self):
         output = save_query_output("tasks", [{"path": "wiki/collections/tasks.md", "line": "+ Ship"}])
@@ -133,7 +140,7 @@ class SecondBrainTests(unittest.TestCase):
 
     def test_automatic_collection_candidates_exclude_wiki(self):
         candidates = collection_source_candidates()
-        self.assertFalse(any(path.is_relative_to(WIKI) for path in candidates))
+        self.assertFalse(any(path.is_relative_to(self.wiki) for path in candidates))
 
     def test_lint_helpers(self):
         self.assertIsInstance(lint_links(), list)
@@ -214,13 +221,80 @@ class ReviewRegressionTests(unittest.TestCase):
             "empty-source.md": f"---\nsource: null\nsource_sha256: '{digest}'\n---\n",
             "missing-hash.md": f"---\nsource: '{source.as_posix()}'\n---\n",
             "bad-hash.md": f"---\nsource: '{source.as_posix()}'\nsource_sha256: bad\n---\n",
-            "valid.md": f"---\nsource: '{source.as_posix()}'\nsource_sha256: '{digest}'\n---\n",
+            "valid.md": second_brain.front_matter("Source", source.as_posix(), "file", digest) + "\n",
         }
         for name, text in cases.items():
             (self.raw / name).write_text(text, encoding="utf-8")
         issues = lint_source_drift()
         self.assertEqual({issue["path"] for issue in issues}, {f"raw/{name}" for name in cases if name != "valid.md"})
         self.assertTrue(all(issue["issue"] for issue in issues))
+
+    def test_lint_validates_required_metadata_fields(self):
+        source = self.root / "source.txt"
+        source.write_bytes(b"source")
+        digest = hashlib.sha256(b"source").hexdigest()
+        base = {
+            "title": "Source", "source": str(source), "source_type": "file",
+            "ingested_at": "2026-01-01T10:00:00Z", "source_sha256": digest,
+            "tags": [], "status": "active", "immutable": True,
+        }
+        import yaml
+        path = self.raw / "source.md"
+        for field in base:
+            with self.subTest(missing=field):
+                metadata = dict(base)
+                del metadata[field]
+                path.write_text("---\n" + yaml.safe_dump(metadata) + "---\n", encoding="utf-8")
+                self.assertTrue(lint_source_drift(), field)
+        for field, invalid in (("title", ""), ("source_type", "other"), ("source_type", []),
+                               ("ingested_at", "2026-02-30"), ("tags", "tag"),
+                               ("status", ""), ("immutable", False)):
+            with self.subTest(field=field):
+                metadata = dict(base, **{field: invalid})
+                path.write_text("---\n" + yaml.safe_dump(metadata) + "---\n", encoding="utf-8")
+                self.assertTrue(lint_source_drift(), field)
+        for field, invalid in (("source_type", "url"), ("source", "https://example.com/note")):
+            with self.subTest(mismatch=field):
+                metadata = dict(base, **{field: invalid})
+                path.write_text("---\n" + yaml.safe_dump(metadata) + "---\n", encoding="utf-8")
+                self.assertTrue(lint_source_drift())
+        path.write_text("---\n" + yaml.safe_dump(base) + "---\n", encoding="utf-8")
+        self.assertEqual(lint_source_drift(), [])
+
+    def test_queries_are_logged_once_with_and_without_saved_output(self):
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        (self.root / "index.md").write_text("# Test topic\n", encoding="utf-8")
+        for options in ([], ["--json"], ["--save", "--json"]):
+            with self.subTest(options=options):
+                log = self.root / "log.md"
+                log.write_text("# Operations Log\n", encoding="utf-8")
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "tools" / "second_brain.py"), "query", "topic", *options],
+                    env=env, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log.read_text(encoding="utf-8").count("] query | topic"), 1)
+
+    def test_image_extensions_follow_content_not_url_name(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"image"
+        jpeg = b"\xff\xd8\xff" + b"image"
+        cases = [
+            ("https://example.com/image", png, "image/png", ".png"),
+            ("https://example.com/image.jpg", png, "image/png", ".png"),
+            ("https://example.com/image.png", jpeg, "image/jpeg", ".jpg"),
+        ]
+        for url, data, content_type, suffix in cases:
+            with self.subTest(url=url):
+                with patch.object(second_brain, "fetch_url", return_value=(data, content_type)):
+                    result = second_brain.ingest(url)
+                text = (self.root / result["raw"]).read_text(encoding="utf-8")
+                self.assertIn(suffix + ")", text)
+                self.assertTrue(any(path.suffix == suffix and path.read_bytes() == data
+                                    for path in (self.raw / "assets").rglob("*") if path.is_file()))
+        with patch.object(second_brain, "fetch_url", return_value=(b"not an image", "image/png")):
+            with self.assertRaisesRegex(ValueError, "image format"):
+                second_brain.ingest("https://example.com/broken")
 
     def test_binary_local_fallback_requires_conversion(self):
         samples = {
