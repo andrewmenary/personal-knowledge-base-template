@@ -83,7 +83,7 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 5. Change date-bound tasks to `< YYYY-MM-DD`; scheduled migrations require a valid calendar date.
 6. Preserve one canonical task record; historical dates may cite it.
 
-The migration CLI matches complete task descriptions case-insensitively with normalized whitespace, excluding scheduling dates, migration destinations, and collection provenance. It refuses ambiguous matches rather than picking one.
+The migration CLI matches complete task descriptions case-insensitively with normalized whitespace, excluding scheduling dates, migration destinations, and collection provenance, regardless of status. Leading `YYYY-MM-DD ` tokens and a trailing ` -> destination` are reserved task metadata, not literal description text; migrations replace or remove them as appropriate and preserve collection provenance. The CLI refuses ambiguous matches rather than picking one; it does not create or delete destination records.
 
 ### Collections
 

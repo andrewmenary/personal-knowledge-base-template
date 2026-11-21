@@ -307,6 +307,35 @@ def route_bullet(line: str) -> str:
     return "wiki/collections/tasks.md"
 
 
+def task_parts(text: str, *, collection: bool) -> tuple[str, str]:
+    """Separate reserved status metadata from a task description and provenance."""
+    text = text.strip()
+    sources = []
+    arrow = re.search(r"\s+->\s+", text)
+    if collection and arrow:
+        before, metadata = text[:arrow.start()], text[arrow.start():]
+        sources.extend(re.findall(r"\(\[source\]\([^)]+\)\)", metadata))
+        text = before + re.sub(r"\s*\(\[source\]\([^)]+\)\)", "", metadata)
+    while True:
+        if collection:
+            source = re.search(r"\s+(\(\[source\]\([^)]+\)\))$", text)
+            if source:
+                sources.insert(0, source.group(1))
+                text = text[:source.start()]
+                continue
+        destination = re.search(r"\s+->\s+.*$", text)
+        if destination:
+            text = text[:destination.start()]
+            continue
+        break
+    text = re.sub(r"^(?:\d{4}-\d{2}-\d{2}[ \t]+)+", "", text)
+    return text.rstrip(), "".join(f" {source}" for source in sources)
+
+
+def task_identity(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
 def migrate_task(task: str, status: str, target: str | None = None, date: str | None = None) -> list[str]:
     symbols = {"open": "+", "completed": "X", "migrated": ">", "scheduled": "<"}
     symbol = symbols[status]
@@ -317,10 +346,12 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
             calendar_date.fromisoformat(date)
         except ValueError:
             raise ValueError("scheduled tasks require a valid date in YYYY-MM-DD format") from None
-    def normalized(value: str) -> str:
-        return " ".join(value.split()).casefold()
-
-    needle = normalized(task)
+    if target is not None and (
+        not target.strip() or "\n" in target or "\r" in target
+        or re.search(r"\s+->\s+|\(\[source\]\([^)]+\)\)", target)
+    ):
+        raise ValueError("migration target must be a nonempty single destination")
+    needle = task_identity(task_parts(task, collection=True)[0])
     if not needle:
         raise ValueError("task must not be empty")
     candidates = []
@@ -355,26 +386,21 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
             line = original_line.rstrip("\r\n")
             ending = original_line[len(line):]
             parsed = parse_bullet(line)
-            description = str(parsed["text"])
-            if not path.is_relative_to(RAW):
-                description = re.sub(r"(?:\s+\(\[source\]\([^)]+\)\))+$", "", description)
-            if parsed["bullet"] == "<":
-                description = re.sub(r"^\d{4}-\d{2}-\d{2}(?:[ \t]+|$)", "", description)
-            if parsed["bullet"] == ">":
-                description = re.sub(r"\s+->\s+.*$", "", description)
-            if parsed["bullet"] in {" ", "+", ">", "<", "X", "x"} and needle == normalized(description):
+            description, sources = task_parts(str(parsed["text"]), collection=not path.is_relative_to(RAW))
+            if parsed["bullet"] in {" ", "+", ">", "<", "X", "x"} and needle == task_identity(description):
                 match = re.match(r"^([ \t]*(?:[*=!^][ \t]*)*)(\[[ Xx><]\]|[+Xx><])", line)
                 if match is None:
                     continue
                 marker = f"[{symbol if symbol != '+' else ' '}]" if match.group(2).startswith("[") else symbol
-                replacement = match.group(1) + marker + line[match.end():]
+                whitespace = re.match(r"[ \t]*", line[match.end():]).group()
+                replacement = match.group(1) + marker + (whitespace or " ")
                 if status == "scheduled":
-                    remainder = line[match.end():]
-                    if parsed["bullet"] == "<":
-                        remainder = re.sub(r"^([ \t]+)\d{4}-\d{2}-\d{2}(?=[ \t]|$)", "", remainder, count=1)
-                    replacement = match.group(1) + marker + " " + date + remainder
-                elif status == "migrated" and target:
-                    replacement += f" -> {target}"
+                    replacement += f"{date} "
+                replacement += description
+                if status == "migrated" and target:
+                    replacement += f" -> {target.strip()}"
+                replacement += sources
+                replacement += re.search(r"[ \t]*$", line).group()
                 matches.append((path, lines, line_number, replacement + ending))
     if len(matches) > 1:
         locations = ", ".join(f"{path.relative_to(ROOT).as_posix()}:{number + 1}" for path, _, number, _ in matches)

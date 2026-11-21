@@ -227,6 +227,62 @@ class ReviewRegressionTests(unittest.TestCase):
                 self.assertEqual(source.read_text(encoding="utf-8"),
                                  JOURNAL_HEADER + f"  * {marker} 2026-12-01 task\n")
 
+    def test_status_transitions_remove_previous_metadata(self):
+        source = self.raw / "journal.md"
+        source.write_text(JOURNAL_HEADER + "  * [ ]  Ship release\n", encoding="utf-8")
+        for status, options, expected in (
+            ("scheduled", {"date": "2026-12-01"}, "[<]  2026-12-01 Ship release"),
+            ("completed", {}, "[X]  Ship release"),
+            ("migrated", {"target": "First"}, "[>]  Ship release -> First"),
+            ("migrated", {"target": "Second"}, "[>]  Ship release -> Second"),
+            ("migrated", {"target": "Second"}, "[>]  Ship release -> Second"),
+            ("scheduled", {"date": "2027-01-02"}, "[<]  2027-01-02 Ship release"),
+            ("open", {}, "[ ]  Ship release"),
+        ):
+            with self.subTest(status=status, options=options):
+                self.assertEqual(migrate_task("ship release", status, **options), ["raw/journal.md"])
+                self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + f"  * {expected}\n")
+
+    def test_migration_normalizes_legacy_metadata_and_keeps_provenance(self):
+        collection = self.wiki / "collections" / "tasks.md"
+        collection.parent.mkdir()
+        a = "([source](../../raw/a.md))"
+        b = "([source](../../raw/b.md))"
+        for original in (
+            f"> 2026-12-01 Ship {a} -> Old\n",
+            f"> Ship -> Old {a} -> Older {b}\n",
+            f"X 2026-12-01 Ship -> Old {a} {b}\n",
+        ):
+            with self.subTest(original=original):
+                collection.write_text(original, encoding="utf-8")
+                migrate_task("Ship", "migrated", target="New")
+                expected_sources = f" {a}" + (f" {b}" if b in original else "")
+                self.assertEqual(collection.read_text(encoding="utf-8"), f"> Ship -> New{expected_sources}\n")
+                migrate_task("Ship", "completed")
+                self.assertEqual(collection.read_text(encoding="utf-8"), f"X Ship{expected_sources}\n")
+
+    def test_normalized_duplicate_tasks_are_rejected_across_destinations(self):
+        folder = self.wiki / "collections"
+        folder.mkdir()
+        first = folder / "first.md"
+        second = folder / "second.md"
+        first.write_text("> Ship -> Old ([source](../../raw/a.md))\n", encoding="utf-8")
+        second.write_text("< 2026-12-01 ship ([source](../../raw/b.md))\n", encoding="utf-8")
+        originals = [first.read_bytes(), second.read_bytes()]
+        with self.assertRaisesRegex(ValueError, "ambiguous task"):
+            migrate_task("Ship", "completed")
+        self.assertEqual([first.read_bytes(), second.read_bytes()], originals)
+        self.assertFalse((self.root / "log.md").exists())
+
+    def test_invalid_migration_target_does_not_write(self):
+        source = self.raw / "journal.md"
+        original = JOURNAL_HEADER + "+ Ship\n"
+        source.write_text(original, encoding="utf-8")
+        for target in ("", " \t", "One\nTwo", "One -> Two", "One\t->\tTwo", "([source](a.md))"):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "single destination"):
+                migrate_task("Ship", "migrated", target=target)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
     def test_migration_requires_unique_exact_task(self):
         source = self.raw / "journal.md"
         original = JOURNAL_HEADER + "+ Ship fast\n+ Shipments\n+ Ship\n+ ship\n"
