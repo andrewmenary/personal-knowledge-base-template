@@ -214,9 +214,9 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
             asset.write_bytes(data)
             body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
-            converted = convert_markitdown(path)
-            if converted is None:
-                if path.suffix.lower() not in TEXT_SUFFIXES or data.startswith((b"%PDF-", b"PK\x03\x04")):
+            suffix = path.suffix.lower()
+            if suffix in TEXT_SUFFIXES:
+                if data.startswith((b"%PDF-", b"PK\x03\x04")):
                     raise ValueError(f"Binary source requires MarkItDown: {path}")
                 try:
                     converted = data.decode("utf-8")
@@ -224,13 +224,29 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
                     raise ValueError(f"Binary source requires MarkItDown: {path}") from exc
                 if any(ord(char) < 32 and char not in "\t\r\n" for char in converted) or "\x7f" in converted:
                     raise ValueError(f"Binary source requires MarkItDown: {path}")
-            body = converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
+                converted = converted.replace("\r\n", "\n").replace("\r", "\n")
+                body = converted if suffix in {".md", ".markdown"} else (
+                    converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
+                )
+            else:
+                converted = convert_markitdown(path)
+                if converted is None:
+                    raise ValueError(f"Binary source requires MarkItDown: {path}")
+                body = converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
 
     RAW.mkdir(parents=True, exist_ok=True)
     destination_dir = RAW / year
     destination_dir.mkdir(parents=True, exist_ok=True)
     source_type = "url" if is_url else "file"
-    content = front_matter(title, source, source_type, sha, journal) + "\n\n" + gfm(body)
+    if is_url:
+        rendered_body = gfm(body)
+    else:
+        if path.suffix.lower() in {".md", ".markdown"}:
+            rendered_body = body
+        elif path.suffix.lower() in TEXT_SUFFIXES:
+            rendered_body = gfm(body)
+        else:
+            rendered_body = gfm(body)
     sequence = 1
     while True:
         filename = f"{slug}.md" if sequence == 1 else f"{slug}-{sequence}.md"
@@ -240,6 +256,11 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
         except FileExistsError:
             sequence += 1
             continue
+        if not is_url and path.suffix.lower() in {".md", ".markdown"}:
+            rendered_body = rebase_markdown(rendered_body, path, destination, rendered_body)
+            content = front_matter(title, source, source_type, sha, journal) + "\n\n" + rendered_body
+        else:
+            content = front_matter(title, source, source_type, sha, journal) + "\n\n" + rendered_body
         try:
             with handle:
                 handle.write(content)
@@ -385,7 +406,7 @@ def _migrate_task(task: str, status: str, target: str | None, date: str | None) 
         lines = text.splitlines(keepends=True)
         protected = set()
         for token in MarkdownIt("commonmark").parse(text):
-            if token.type in {"fence", "html_block"} and token.map:
+            if token.type in {"fence", "code_block", "html_block"} and token.map:
                 protected.update(range(*token.map))
         for line_number, original_line in enumerate(lines):
             if line_number < body_start or line_number in protected:

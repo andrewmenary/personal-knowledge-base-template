@@ -85,6 +85,8 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 
 The migration CLI matches complete task descriptions case-insensitively with normalized whitespace, excluding scheduling dates, migration destinations, and collection provenance, regardless of status. Leading `YYYY-MM-DD ` tokens and a trailing ` -> destination` are reserved task metadata, not literal description text; migrations replace or remove them as appropriate and preserve collection provenance. Migrated status requires a nonempty `--target`. The CLI rejects missing or ambiguous matches without changing tasks or recording a successful migration; it does not create or delete destination records.
 
+Migration never rewrites headings, ordinary prose, fenced or indented code blocks, or HTML blocks. Text and Markdown ingest preserves UTF-8 Markdown text rather than reflowing or trimming it; line-ending normalization to LF is allowed.
+
 ### Collections
 
 Recognize reading lists, habits, shopping lists, goals, meeting notes, project spreads, and other recurring headings. Merge entries by stable identity into `wiki/collections/<slug>.md`. Preserve source links and do not treat collection entries as daily reflections.

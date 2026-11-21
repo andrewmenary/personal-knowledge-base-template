@@ -175,8 +175,8 @@ class ReviewRegressionTests(unittest.TestCase):
         for original, expected in (
             ("* + priority task\n", "* X priority task\n"),
             ("! [ ] idea task\n", "! [X] idea task\n"),
-            ("  \t*  =  + indented task\n", "  \t*  =  X indented task\n"),
             ("  + indented task\n", "  X indented task\n"),
+            ("  *  =  + indented task\n", "  *  =  X indented task\n"),
         ):
             with self.subTest(original=original):
                 source = self.raw / "journal.md"
@@ -394,6 +394,27 @@ class ReviewRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "task not found"):
             migrate_task("Ship", "completed")
         self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_migration_ignores_indented_code(self):
+        source = self.raw / "journal.md"
+        original = JOURNAL_HEADER + "    + Ship\n\n+ Ship fast\n"
+        source.write_text(original, encoding="utf-8")
+        migrate_task("Ship fast", "completed")
+        self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + "    + Ship\n\nX Ship fast\n")
+
+    def test_markdown_ingest_preserves_source_text_and_relative_links(self):
+        source = self.root / "source.md"
+        source.write_bytes(
+            b"  + preserve indentation  \r\n\r\n"
+            b"[Sibling](sibling.md)\r\n"
+            b"![Image](images/pixel.png)\r\n"
+        )
+        (self.root / "sibling.md").write_text("# Sibling\n", encoding="utf-8")
+        with patch.object(second_brain, "convert_markitdown", return_value="trimmed\n"):
+            result = second_brain.ingest(str(source))
+        raw = (self.root / result["raw"]).read_text(encoding="utf-8")
+        self.assertIn("  + preserve indentation  \n\n[Sibling](../../sibling.md)\n![Image](../../images/pixel.png)", raw)
+        self.assertNotIn("trimmed", raw)
 
     def test_collection_task_matches_without_provenance(self):
         collection = self.wiki / "collections" / "tasks.md"
