@@ -337,6 +337,11 @@ def task_identity(text: str) -> str:
 
 
 def migrate_task(task: str, status: str, target: str | None = None, date: str | None = None) -> list[str]:
+    with repository_lock("content"):
+        return _migrate_task(task, status, target, date)
+
+
+def _migrate_task(task: str, status: str, target: str | None, date: str | None) -> list[str]:
     symbols = {"open": "+", "completed": "X", "migrated": ">", "scheduled": "<"}
     symbol = symbols[status]
     if status == "scheduled":
@@ -346,6 +351,8 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
             calendar_date.fromisoformat(date)
         except ValueError:
             raise ValueError("scheduled tasks require a valid date in YYYY-MM-DD format") from None
+    if status == "migrated" and target is None:
+        raise ValueError("migration target must be a nonempty single destination")
     if target is not None and (
         not target.strip() or "\n" in target or "\r" in target
         or re.search(r"\s+->\s+|\(\[source\]\([^)]+\)\)", target)
@@ -405,6 +412,8 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
     if len(matches) > 1:
         locations = ", ".join(f"{path.relative_to(ROOT).as_posix()}:{number + 1}" for path, _, number, _ in matches)
         raise ValueError(f"ambiguous task; multiple exact matches: {locations}")
+    if not matches:
+        raise ValueError(f"task not found: {task}")
     changed = []
     if matches:
         path, lines, line_number, replacement = matches[0]
@@ -481,6 +490,11 @@ def rebase_markdown(text: str, source: Path, destination: Path, source_text: str
 
 
 def extract_collections(source: Path) -> list[dict[str, str]]:
+    with repository_lock("content"):
+        return _extract_collections(source)
+
+
+def _extract_collections(source: Path) -> list[dict[str, str]]:
     text = source.read_text(encoding="utf-8")
     resolved_source = source.resolve()
     if not resolved_source.is_relative_to(ROOT.resolve()):

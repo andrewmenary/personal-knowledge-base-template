@@ -83,7 +83,7 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 5. Change date-bound tasks to `< YYYY-MM-DD`; scheduled migrations require a valid calendar date.
 6. Preserve one canonical task record; historical dates may cite it.
 
-The migration CLI matches complete task descriptions case-insensitively with normalized whitespace, excluding scheduling dates, migration destinations, and collection provenance, regardless of status. Leading `YYYY-MM-DD ` tokens and a trailing ` -> destination` are reserved task metadata, not literal description text; migrations replace or remove them as appropriate and preserve collection provenance. The CLI refuses ambiguous matches rather than picking one; it does not create or delete destination records.
+The migration CLI matches complete task descriptions case-insensitively with normalized whitespace, excluding scheduling dates, migration destinations, and collection provenance, regardless of status. Leading `YYYY-MM-DD ` tokens and a trailing ` -> destination` are reserved task metadata, not literal description text; migrations replace or remove them as appropriate and preserve collection provenance. Migrated status requires a nonempty `--target`. The CLI rejects missing or ambiguous matches without changing tasks or recording a successful migration; it does not create or delete destination records.
 
 ### Collections
 
@@ -125,7 +125,7 @@ Image file extensions are derived from supported image content, not a URL suffix
 
 Without a successful conversion, local text fallback accepts extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files, provided their UTF-8 content has no binary control characters.
 
-URL conversion uses operation-private temporary files, never fixed inbox filenames. Concurrent CLI ingests reserve distinct raw filenames and serialize index and operation-log updates using locks in the Git-ignored `.second-brain-locks/` directory. Other tools editing those files must use the same locks to coordinate; do not remove lock files while operations are running.
+URL conversion uses operation-private temporary files, never fixed inbox filenames. Concurrent CLI ingests reserve distinct raw filenames and serialize index and operation-log updates using locks in the Git-ignored `.second-brain-locks/` directory. Collection extraction and task migration share the `content` lock across their complete read-modify-write operations. Other tools editing those files must use the same locks to coordinate; do not remove lock files while operations are running.
 
 ### Query
 

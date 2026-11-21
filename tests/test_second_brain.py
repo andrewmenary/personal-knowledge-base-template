@@ -85,8 +85,8 @@ class SecondBrainTests(unittest.TestCase):
         path = self.raw / "plain-test.md"
         path.write_text("# Release\n\nWe need to release soon.\n", encoding="utf-8")
         try:
-            changed = migrate_task("release", "completed")
-            self.assertEqual(changed, [])
+            with self.assertRaisesRegex(ValueError, "task not found"):
+                migrate_task("release", "completed")
             self.assertIn("We need to release soon.", path.read_text(encoding="utf-8"))
         finally:
             path.unlink(missing_ok=True)
@@ -283,6 +283,98 @@ class ReviewRegressionTests(unittest.TestCase):
                 migrate_task("Ship", "migrated", target=target)
             self.assertEqual(source.read_text(encoding="utf-8"), original)
 
+    def test_missing_target_preserves_migrated_destination(self):
+        source = self.raw / "journal.md"
+        original = JOURNAL_HEADER + "> Ship -> Existing\n"
+        source.write_text(original, encoding="utf-8")
+        for target in (None, "", "   "):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "target"):
+                migrate_task("Ship", "migrated", target=target)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertFalse((self.root / "log.md").exists())
+
+    def test_migration_cli_missing_target_and_task_fail_without_log(self):
+        source = self.raw / "journal.md"
+        original = JOURNAL_HEADER + "> Ship -> Existing\n"
+        source.write_text(original, encoding="utf-8")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        for arguments, error in ((["Ship", "migrated"], "target"),
+                                 (["Missing", "completed"], "task not found")):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "tools" / "second_brain.py"), "migrate", *arguments],
+                    env=env, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(source.read_text(encoding="utf-8"), original)
+                self.assertFalse((self.root / "log.md").exists())
+
+    def test_content_lock_serializes_collection_and_migration_processes(self):
+        collection = self.wiki / "collections" / "tasks.md"
+        collection.parent.mkdir()
+        collection.write_text("+ Ship\n", encoding="utf-8")
+        source = self.raw / "reading.md"
+        source.write_text("# Reading List\n\n- Book\n", encoding="utf-8")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        script = str(ROOT / "tools" / "second_brain.py")
+        with second_brain.repository_lock("content"):
+            processes = [
+                subprocess.Popen([sys.executable, script, *args], env=env, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                for args in (["migrate", "Ship", "completed"],
+                             ["extract-collections", str(source)])
+            ]
+            self.addCleanup(lambda: [process.kill() for process in processes if process.poll() is None])
+            import time
+            time.sleep(2)
+            for process in processes:
+                self.assertIsNone(process.poll(), "process bypassed the content lock")
+            self.assertEqual(collection.read_text(encoding="utf-8"), "+ Ship\n")
+            self.assertFalse((collection.parent / "reading-list.md").exists())
+        for process in processes:
+            _, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(collection.read_text(encoding="utf-8"), "X Ship\n")
+        self.assertIn("- Book", (collection.parent / "reading-list.md").read_text(encoding="utf-8"))
+
+    def test_overlapping_collection_processes_preserve_entries(self):
+        sources = []
+        for i in range(5):
+            source = self.raw / f"source-{i}.md"
+            source.write_text(f"# Reading List\n\n- Book {i}\n", encoding="utf-8")
+            sources.append(source)
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        script = str(ROOT / "tools" / "second_brain.py")
+        processes = [subprocess.Popen([sys.executable, script, "extract-collections", str(source)],
+                                      env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for source in sources]
+        self.addCleanup(lambda: [process.kill() for process in processes if process.poll() is None])
+        for process in processes:
+            _, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, stderr)
+        text = (self.wiki / "collections" / "reading-list.md").read_text(encoding="utf-8")
+        for i in range(5):
+            self.assertIn(f"- Book {i} ([source](../../raw/source-{i}.md))", text)
+
+    def test_overlapping_migrations_preserve_both_tasks(self):
+        source = self.raw / "journal.md"
+        source.write_text(JOURNAL_HEADER + "+ Ship\n+ Review\n", encoding="utf-8")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        script = str(ROOT / "tools" / "second_brain.py")
+        processes = [subprocess.Popen([sys.executable, script, "migrate", task, "completed"],
+                                      env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for task in ("Ship", "Review")]
+        self.addCleanup(lambda: [process.kill() for process in processes if process.poll() is None])
+        for process in processes:
+            _, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + "X Ship\nX Review\n")
+
     def test_migration_requires_unique_exact_task(self):
         source = self.raw / "journal.md"
         original = JOURNAL_HEADER + "+ Ship fast\n+ Shipments\n+ Ship\n+ ship\n"
@@ -299,7 +391,8 @@ class ReviewRegressionTests(unittest.TestCase):
         source = self.raw / "journal.md"
         original = JOURNAL_HEADER + "```\n+ Ship\n```\n+ Ship fast\n"
         source.write_text(original, encoding="utf-8")
-        self.assertEqual(migrate_task("Ship", "completed"), [])
+        with self.assertRaisesRegex(ValueError, "task not found"):
+            migrate_task("Ship", "completed")
         self.assertEqual(source.read_text(encoding="utf-8"), original)
 
     def test_collection_task_matches_without_provenance(self):
