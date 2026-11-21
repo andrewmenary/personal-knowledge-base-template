@@ -171,6 +171,28 @@ class ReviewRegressionTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_front_matter_preserves_control_characters_in_strings(self):
+        title = 'Line one\nLine "two"\tend'
+        source = "https://example.com/a\nb"
+        metadata = second_brain.parse_front_matter(second_brain.front_matter(title, source, "url", "0" * 64))
+        self.assertEqual(metadata["title"], title)
+        self.assertEqual(metadata["source"], source)
+
+    def test_collection_merge_preserves_existing_blocks_and_new_source_order(self):
+        source = self.raw / "reading.md"
+        source.write_text("# Reading List\n\n- First\n\n> quoted\n> block\n\n- Last\n", encoding="utf-8")
+        destination = self.wiki / "collections" / "reading-list.md"
+        destination.parent.mkdir()
+        original = "# Reading List\n\n```text\nrepeated\nrepeated\n```\n\n"
+        destination.write_text(original, encoding="utf-8")
+        extract_collections(source)
+        text = destination.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(original))
+        self.assertLess(text.index("- First"), text.index("> quoted"))
+        self.assertLess(text.index("> quoted"), text.index("- Last"))
+        extract_collections(source)
+        self.assertEqual(destination.read_text(encoding="utf-8"), text)
+
     def test_migration_preserves_indent_and_signifiers(self):
         for original, expected in (
             ("* + priority task\n", "* X priority task\n"),

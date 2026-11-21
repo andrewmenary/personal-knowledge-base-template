@@ -58,7 +58,7 @@ def gfm(text: str) -> str:
 
 
 def yaml_quote(value: object) -> str:
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return json.dumps(str(value), ensure_ascii=True)
 
 
 def front_matter(title: str, source: str, source_type: str, source_sha256: str, journal: bool = False) -> str:
@@ -585,26 +585,50 @@ def _extract_collections(source: Path) -> list[dict[str, str]]:
             r"(?ms)^<!-- collection-entry:([0-9a-f]{64}) -->\n(.*?)\n"
             r"((?:\(\[source\]\([^)]+\)\)(?: |\n|$))+)\n<!-- /collection-entry -->"
         )
+        block_matches = list(block_pattern.finditer(existing))
         blocks = {}
-        def remember_block(match):
-            blocks[match.group(1)] = [match.group(2).rstrip("\n"), match.group(3).strip()]
-            return ""
-        existing_without_blocks = block_pattern.sub(remember_block, existing)
-        lines = []
+        edits = {}
+        additions = []
+        for match in block_matches:
+            entry = match.group(2).rstrip("\n")
+            digest = hashlib.sha256(entry.strip().encode("utf-8")).hexdigest()
+            if digest == match.group(1):
+                blocks[entry.strip()] = match
         provenance = re.compile(r"(?:\s+\(\[source\]\([^)]+\)\))+$")
         annotation = re.compile(r"\(\[source\]\([^)]+\)\)")
         identities = {}
-        for line in existing_without_blocks.splitlines():
+        existing_lines = existing.splitlines(keepends=True)
+        offsets = [0]
+        for line in existing_lines:
+            offsets.append(offsets[-1] + len(line))
+        existing_tokens = parser.parse(existing)
+        for token in existing_tokens:
+            if token.type != "list_item_open" or token.level != 1 or not token.map:
+                continue
+            start, end = token.map
+            meaningful = [i for i in range(start, end) if existing_lines[i].strip()]
+            if len(meaningful) != 1:
+                continue
+            line_number = meaningful[0]
+            start_offset, end_offset = offsets[line_number], offsets[line_number + 1]
+            if any(match.start() <= start_offset < match.end() for match in block_matches):
+                continue
+            line = existing_lines[line_number].rstrip("\r\n")
             identity = provenance.sub("", line).strip()
-            if identity and not identity.startswith("#"):
-                if identity in identities:
-                    index = identities[identity]
-                    for link in annotation.findall(line):
-                        if link not in lines[index]:
-                            lines[index] += f" {link}"
-                    continue
-                identities[identity] = len(lines)
-            lines.append(line)
+            if not identity:
+                continue
+            if identity in identities and annotation.search(line):
+                previous = identities[identity]
+                merged = edits.get(previous, existing[previous[0]:previous[1]])
+                ending = "\n" if merged.endswith("\n") else ""
+                merged = merged.rstrip("\r\n")
+                for link in annotation.findall(line):
+                    if link not in merged:
+                        merged += f" {link}"
+                edits[previous] = merged + ending
+                edits[(start_offset, end_offset)] = ""
+            elif identity not in identities:
+                identities[identity] = (start_offset, end_offset)
         for start, end in entries:
             entry = "\n".join(
                 source_lines[line] if line in protected else
@@ -615,23 +639,46 @@ def _extract_collections(source: Path) -> list[dict[str, str]]:
             if not identity:
                 continue
             if "\n" in identity:
-                digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-                if digest not in blocks:
-                    blocks[digest] = [entry, source_annotation]
-                elif source_annotation not in blocks[digest][1]:
-                    blocks[digest][1] += " " + source_annotation
+                if identity in blocks:
+                    match = blocks[identity]
+                    if match is None:
+                        continue
+                    key = (match.start(), match.end())
+                    block = edits.get(key, match.group())
+                    if source_annotation not in block:
+                        end_marker = "\n<!-- /collection-entry -->"
+                        block = block[:-len(end_marker)] + f" {source_annotation}" + end_marker
+                        edits[key] = block
+                else:
+                    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                    block = f"<!-- collection-entry:{digest} -->\n{entry}\n\n{source_annotation}\n<!-- /collection-entry -->"
+                    additions.append(block)
+                    blocks[identity] = None
                 continue
             if identity in identities:
-                index = identities[identity]
-                if source_annotation not in lines[index]:
-                    lines[index] += f" {source_annotation}"
+                key = identities[identity]
+                if key is None:
+                    for index, added in enumerate(additions):
+                        if provenance.sub("", added).strip() == identity and source_annotation not in added:
+                            additions[index] += f" {source_annotation}"
+                            break
+                else:
+                    line = edits.get(key, existing[key[0]:key[1]])
+                    if source_annotation not in line:
+                        ending = "\n" if line.endswith("\n") else ""
+                        edits[key] = line.rstrip("\r\n") + f" {source_annotation}" + ending
             else:
-                identities[identity] = len(lines)
-                lines.append(f"{entry} {source_annotation}")
-        updated = "\n".join(lines).strip()
-        for digest, (entry, sources) in blocks.items():
-            updated += f"\n\n<!-- collection-entry:{digest} -->\n{entry}\n\n{sources}\n<!-- /collection-entry -->"
-        updated += "\n"
+                identities[identity] = None
+                additions.append(f"{entry} {source_annotation}")
+        updated = existing
+        for (start, end), replacement in sorted(edits.items(), reverse=True):
+            updated = updated[:start] + replacement + updated[end:]
+        for entry in additions:
+            if updated and not updated.endswith("\n"):
+                updated += "\n"
+            if updated and not updated.endswith("\n\n"):
+                updated += "\n"
+            updated += entry + "\n"
         if updated != existing:
             destination.write_text(updated, encoding="utf-8")
         update_collection_index(name, destination)

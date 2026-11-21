@@ -91,7 +91,7 @@ Migration never rewrites headings, ordinary prose, fenced or indented code block
 
 Recognize reading lists, habits, shopping lists, goals, meeting notes, project spreads, and other recurring headings. Merge entries by stable identity into `wiki/collections/<slug>.md`. Preserve source links and do not treat collection entries as daily reflections.
 
-For automatic extraction, identity is the entry or complete block after rebasing Markdown destinations to the collection location and removing leading and trailing whitespace, including its Markdown bullet or task marker. Matching entries retain links for each source. Multiline blocks retain their structure with provenance outside the block.
+For automatic extraction, identity is the entry or complete block after rebasing Markdown destinations to the collection location and removing leading and trailing whitespace, including its Markdown bullet or task marker. Matching entries retain links for each source. Multiline blocks retain their structure with provenance outside the block. New entries are appended in source order; unrelated existing content is preserved.
 
 ### OCR cleanup
 
