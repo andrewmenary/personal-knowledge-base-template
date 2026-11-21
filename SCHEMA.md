@@ -130,6 +130,10 @@ Read `index.md`, search relevant wiki pages, and synthesize answers with source 
 
 The `weekend-reminders` skill provides a Friday preview and a first-workday check-in, using configured workdays and known holidays without assuming calendar completeness. Scheduling and delivery are host responsibilities; prompts do not guarantee notifications or automatic snoozes. Preserve raw sources and canonical task statuses when preparing or deferring a reminder.
 
+### Daily and periodic routines
+
+The routine skills follow `.github/routine-guidance.md` for concise, optional check-ins. Scheduling stays with the host. Reviews and reminders do not silently change journal entries, task statuses, or events; explicitly requested captures and migrations follow the existing rapid-log rules.
+
 ### Lint
 
 Lint broken GFM links, orphan wiki pages, missing raw sources, source hash drift, and stale front matter. URL drift is opt-in with `--check-urls`.

@@ -52,6 +52,21 @@ Provide your time zone, usual workdays, holidays or days off, and an authorized 
 
 These are reusable prompts, not preconfigured automations. Configure the schedules in your chosen host and check its delivery behavior. A host may only wake an active app session, so an 8 AM notification is **not guaranteed** if you log in later. Use a host that queues or retries missed runs at next login, or ask for the check-in manually. If delivery cannot be verified, a retry may repeat a reminder.
 
+### Daily and periodic routines
+
+Ask naturally, or use these skill names in a reusable host prompt:
+
+- "Help me start a morning log." (`/morning-log`)
+- "Help me plan today." (`/daily-plan`)
+- "Let me capture a note from today." (`/evening-capture`)
+- "Show me overdue tasks." (`/overdue-tasks`)
+- "Remind me about upcoming events." (`/upcoming-events`)
+- "Help me review my week." (`/weekly-review`)
+- "Help me review tasks for monthly migration." (`/monthly-migration`)
+- "Help me shut down for the day." (`/shutdown-check`)
+
+These routines give one primary next action and can be skipped or deferred without changing task status. They use the knowledge base and any authorized calendar available; missing information is noted. Choose times, time zone, workdays, holidays, and prompts in your automation host, not this repository. No schedules or notifications are created by installing the skills, and missed-run and snooze behavior depends on the host. See the delivery limitations under **Weekend reminders**.
+
 ## Manual CLI
 
 Install the required YAML and Markdown parsers and optional MarkItDown conversion support:
