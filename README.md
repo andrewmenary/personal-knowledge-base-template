@@ -69,7 +69,7 @@ These routines give one primary next action and can be skipped or deferred witho
 
 ## Manual CLI
 
-Install the required YAML and Markdown parsers and optional MarkItDown conversion support:
+Install the required YAML and Markdown parsers, file locking, and optional MarkItDown conversion support:
 
 ```sh
 pip install -r requirements.txt

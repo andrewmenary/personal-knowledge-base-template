@@ -4,6 +4,8 @@ import unittest
 import os
 import hashlib
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -160,7 +162,7 @@ class ReviewRegressionTests(unittest.TestCase):
         patcher = patch.multiple(
             second_brain, ROOT=self.root, RAW=self.raw, WIKI=self.wiki,
             LOG=self.root / "log.md", INDEX=self.root / "index.md",
-            ASSETS=self.raw / "assets",
+            ASSETS=self.raw / "assets", INBOX=self.root / "inbox",
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -364,6 +366,116 @@ class ReviewRegressionTests(unittest.TestCase):
         with patch.object(second_brain, "convert_markitdown", return_value="# Converted PDF"):
             result = second_brain.ingest(str(self.root / "document.pdf"))
             self.assertIn("Converted PDF", (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_url_staging_is_unique_and_preserves_inbox(self):
+        inbox = self.root / "inbox"
+        inbox.mkdir()
+        existing = inbox / "_download.html"
+        existing.write_text("Keep this capture", encoding="utf-8")
+        barrier = threading.Barrier(2)
+        paths = []
+
+        def convert(path):
+            paths.append(path)
+            before = path.read_bytes()
+            barrier.wait(timeout=10)
+            self.assertEqual(path.read_bytes(), before)
+            return before.decode()
+
+        def fetch(url):
+            return url.encode(), "text/html"
+
+        urls = ["https://example.com/first.html", "https://example.com/second.html"]
+        with patch.object(second_brain, "fetch_url", side_effect=fetch), \
+             patch.object(second_brain, "convert_markitdown", side_effect=convert):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(second_brain.ingest, urls))
+        self.assertEqual(len(set(paths)), 2)
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertEqual(existing.read_text(encoding="utf-8"), "Keep this capture")
+        for result, url in zip(results, urls):
+            self.assertIn(url, (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_url_staging_cleans_up_when_conversion_raises(self):
+        paths = []
+
+        def convert(path):
+            paths.append(path)
+            raise RuntimeError("conversion failed")
+
+        with patch.object(second_brain, "fetch_url", return_value=(b"text", "text/html")), \
+             patch.object(second_brain, "convert_markitdown", side_effect=convert):
+            with self.assertRaisesRegex(RuntimeError, "conversion failed"):
+                second_brain.ingest("https://example.com/test.html")
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].exists())
+
+    def test_concurrent_ingests_preserve_raw_captures_index_and_log(self):
+        source_dirs = [self.root / f"source-{i}" for i in range(8)]
+        for i, directory in enumerate(source_dirs):
+            directory.mkdir()
+            (directory / "same.txt").write_text(f"Unique content {i}", encoding="utf-8")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(ROOT / "tools" / "second_brain.py"),
+                 "ingest", str(directory / "same.txt"), "--json"],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ) for directory in source_dirs
+        ]
+        import json
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, stderr)
+            results.append(json.loads(stdout))
+        paths = [result["raw"] for result in results]
+        self.assertEqual(len(set(paths)), len(source_dirs))
+        index = (self.root / "index.md").read_text(encoding="utf-8")
+        for i, path in enumerate(paths):
+            self.assertIn(f"Unique content {i}", (self.root / path).read_text(encoding="utf-8"))
+            self.assertIn(f"]({path})", index)
+        self.assertEqual((self.root / "log.md").read_text(encoding="utf-8").count("] ingest | Same"), len(paths))
+
+    def test_existing_raw_slug_collision_is_never_overwritten(self):
+        source = self.root / "same.txt"
+        source.write_text("New content", encoding="utf-8")
+        year = second_brain.datetime.now(second_brain.timezone.utc).strftime("%Y")
+        destination = self.raw / year
+        destination.mkdir()
+        existing = destination / "same.md"
+        existing.write_text("Previous capture", encoding="utf-8")
+        with patch.object(second_brain, "convert_markitdown", return_value=None):
+            result = second_brain.ingest(str(source))
+        self.assertEqual(existing.read_text(encoding="utf-8"), "Previous capture")
+        self.assertEqual(Path(result["raw"]).name, "same-2.md")
+        self.assertIn("New content", (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_raw_and_collection_index_updates_share_lock(self):
+        started = threading.Barrier(3)
+
+        def update_raw():
+            started.wait(timeout=10)
+            second_brain.update_index("Raw", "raw/example.md")
+
+        def update_collection():
+            started.wait(timeout=10)
+            second_brain.update_collection_index("reading-list", self.wiki / "reading-list.md")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with second_brain.repository_lock("index"):
+                futures = [pool.submit(update_raw), pool.submit(update_collection)]
+                started.wait(timeout=10)
+                for future in futures:
+                    with self.assertRaises(TimeoutError):
+                        future.result(timeout=0.2)
+                (self.root / "index.md").write_text("# Preserved edit\n", encoding="utf-8")
+            for future in futures:
+                future.result(timeout=10)
+        index = (self.root / "index.md").read_text(encoding="utf-8")
+        for expected in ("# Preserved edit", "raw/example.md", "wiki/reading-list.md"):
+            self.assertIn(expected, index)
 
     def test_ocr_alias_expansion_is_literal(self):
         self.assertEqual(clean_ocr("See loc and ref", {"loc": r"C:\temp\notes", "ref": r"\1\g<name>"}),

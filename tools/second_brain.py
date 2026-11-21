@@ -10,6 +10,8 @@ import json
 import re
 import sys
 import os
+import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
@@ -17,6 +19,7 @@ from urllib.parse import quote, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
 import yaml
+from filelock import FileLock
 from markdown_it import MarkdownIt
 
 
@@ -140,11 +143,18 @@ def image_extension(data: bytes) -> str:
 
 
 def append_log(operation: str, title: str, detail: str = ""):
-    if not LOG.exists():
-        LOG.write_text("# Operations Log\n", encoding="utf-8")
-    suffix = f" - {detail}" if detail else ""
-    with LOG.open("a", encoding="utf-8") as handle:
-        handle.write(f"\n## [{utc_now()}] {operation} | {title}{suffix}\n")
+    with repository_lock("log"):
+        if not LOG.exists():
+            LOG.write_text("# Operations Log\n", encoding="utf-8")
+        suffix = f" - {detail}" if detail else ""
+        with LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n## [{utc_now()}] {operation} | {title}{suffix}\n")
+
+
+def repository_lock(name: str) -> FileLock:
+    directory = ROOT / ".second-brain-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(directory / f"{name}.lock"))
 
 
 def ingest(source: str) -> dict[str, str]:
@@ -170,11 +180,10 @@ def ingest(source: str) -> dict[str, str]:
             if content_type and not any(content_type.startswith(prefix) for prefix in TEXT_TYPES):
                 if not convert_markitdown_available():
                     raise ValueError(f"Binary URL content requires MarkItDown: {source}")
-            INBOX.mkdir(parents=True, exist_ok=True)
-            temp = INBOX / f"_download{suffix or '.html'}"
-            temp.write_bytes(data)
-            converted = convert_markitdown(temp)
-            temp.unlink(missing_ok=True)
+            with tempfile.TemporaryDirectory(prefix="second-brain-") as directory:
+                temp = Path(directory) / f"{uuid.uuid4().hex}{suffix or '.html'}"
+                temp.write_bytes(data)
+                converted = convert_markitdown(temp)
             if converted is None:
                 if content_type and not any(content_type.startswith(prefix) for prefix in TEXT_TYPES):
                     raise ValueError(f"Binary URL content could not be converted: {source}")
@@ -217,17 +226,24 @@ def ingest(source: str) -> dict[str, str]:
     RAW.mkdir(parents=True, exist_ok=True)
     destination_dir = RAW / year
     destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / f"{slug}.md"
-    sequence = 2
-    while destination.exists():
-        destination = destination_dir / f"{slug}-{sequence}.md"
-        sequence += 1
-
     source_type = "url" if is_url else "file"
-    destination.write_text(
-        front_matter(title, source, source_type, sha) + "\n\n" + gfm(body),
-        encoding="utf-8",
-    )
+    content = front_matter(title, source, source_type, sha) + "\n\n" + gfm(body)
+    sequence = 1
+    while True:
+        filename = f"{slug}.md" if sequence == 1 else f"{slug}-{sequence}.md"
+        destination = destination_dir / filename
+        try:
+            handle = destination.open("x", encoding="utf-8")
+        except FileExistsError:
+            sequence += 1
+            continue
+        try:
+            with handle:
+                handle.write(content)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        break
     relative = destination.relative_to(ROOT).as_posix()
     append_log("ingest", title, f"[{relative}]")
     update_index(title, relative)
@@ -235,9 +251,13 @@ def ingest(source: str) -> dict[str, str]:
 
 
 def update_index(title: str, relative_source: str):
+    with repository_lock("index"):
+        _update_index(title, relative_source, "## Raw sources")
+
+
+def _update_index(title: str, relative_source: str, section: str):
     text = INDEX.read_text(encoding="utf-8") if INDEX.exists() else "# Knowledge Index\n"
     link = f"- [{title}]({relative_source})"
-    section = "## Raw sources"
     if link not in text:
         if section in text:
             text = text.replace(section, section + "\n\n" + link)
@@ -247,16 +267,9 @@ def update_index(title: str, relative_source: str):
 
 
 def update_collection_index(name: str, destination: Path):
-    text = INDEX.read_text(encoding="utf-8") if INDEX.exists() else "# Knowledge Index\n"
     relative = destination.relative_to(ROOT).as_posix()
-    link = f"- [{name.replace('-', ' ').title()}]({relative})"
-    section = "## Collections"
-    if link not in text:
-        if section in text:
-            text = text.replace(section, section + "\n\n" + link)
-        else:
-            text = text.rstrip() + "\n\n" + section + "\n\n" + link
-        INDEX.write_text(gfm(text), encoding="utf-8")
+    with repository_lock("index"):
+        _update_index(name.replace("-", " ").title(), relative, "## Collections")
 
 
 def parse_bullet(line: str) -> dict[str, object]:

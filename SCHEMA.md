@@ -122,6 +122,8 @@ Image file extensions are derived from supported image content, not a URL suffix
 
 Without a successful conversion, local text fallback accepts extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files, provided their UTF-8 content has no binary control characters.
 
+URL conversion uses operation-private temporary files, never fixed inbox filenames. Concurrent CLI ingests reserve distinct raw filenames and serialize index and operation-log updates using locks in the Git-ignored `.second-brain-locks/` directory. Other tools editing those files must use the same locks to coordinate; do not remove lock files while operations are running.
+
 ### Query
 
 Read `index.md`, search relevant wiki pages, and synthesize answers with source links. Optional output goes to `wiki/output/`. The CLI appends one query operation to `log.md` whether or not output is saved.
@@ -142,7 +144,7 @@ Link lint checks inline links, images, and defined reference links; it reports u
 
 ## Implementation decisions
 
-- Python, PyYAML, and markdown-it-py are required for tooling, YAML validation, and Markdown link parsing.
+- Python, PyYAML, markdown-it-py, and filelock are required for tooling, YAML validation, Markdown link parsing, and concurrent writes.
 - MarkItDown is optional.
 - Entry point: `python tools/second_brain.py`.
 - Compatibility entry point: `python second_brain.py`.
