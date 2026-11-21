@@ -207,6 +207,40 @@ class ReviewRegressionTests(unittest.TestCase):
                 migrate_task(str(parse_bullet(original)["text"]), "completed")
                 self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + expected)
 
+    def test_completion_requires_all_nested_subtasks_and_never_auto_promotes(self):
+        source = self.raw / "journal.md"
+        original = (JOURNAL_HEADER + "+ Project\n  + First\n    [ ] Detail\n"
+                    "  + ~~Discarded~~\n+ Unrelated\n")
+        source.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unfinished subtasks"):
+            migrate_task("Project", "completed")
+        with self.assertRaisesRegex(ValueError, "unfinished subtasks"):
+            migrate_task("First", "completed")
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+        self.assertFalse((self.root / "log.md").exists())
+        migrate_task("Detail", "completed")
+        self.assertIn("+ Project\n  + First\n    [X] Detail", source.read_text(encoding="utf-8"))
+        migrate_task("First", "completed")
+        migrate_task("Project", "completed")
+        expected = original.replace("+ Project", "X Project").replace("+ First", "X First").replace("[ ] Detail", "[X] Detail")
+        self.assertEqual(source.read_text(encoding="utf-8"), expected)
+        with self.assertRaisesRegex(ValueError, "completed or irrelevant"):
+            migrate_task("Detail", "open")
+        self.assertEqual(source.read_text(encoding="utf-8"), expected)
+
+    def test_completion_ignores_code_and_other_roots_but_checks_scheduled_subtasks(self):
+        source = self.raw / "journal.md"
+        original = (JOURNAL_HEADER + "+ Project\n\t[<] 2026-12-01 Detail\n"
+                    "\t```\n\t+ literal\n\t```\n+ Other\n  + Pending\n")
+        source.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unfinished subtasks"):
+            migrate_task("Project", "completed")
+        migrate_task("Detail", "completed")
+        migrate_task("Project", "completed")
+        self.assertIn("X Project\n\t[X] Detail\n\t```\n\t+ literal", source.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(ValueError, "completed or irrelevant"):
+            migrate_task("Detail", "scheduled", date="2026-12-02")
+
     def test_scheduled_date_validation_before_any_write(self):
         source = self.raw / "journal.md"
         original = JOURNAL_HEADER + "  * [ ] schedule task\n"
@@ -436,14 +470,107 @@ class ReviewRegressionTests(unittest.TestCase):
         with patch.object(second_brain, "convert_markitdown", return_value="trimmed\n"):
             result = second_brain.ingest(str(source))
         raw = (self.root / result["raw"]).read_text(encoding="utf-8")
-        self.assertIn("  + preserve indentation  \n\n[Sibling](../../sibling.md)\n![Image](../../images/pixel.png)", raw)
+        self.assertIn("  + preserve indentation  \n\n[Sibling](sibling.md)\n![Image](images/pixel.png)", raw)
         self.assertNotIn("trimmed", raw)
 
-    def test_ingest_rebase_failure_closes_and_removes_reserved_capture(self):
+    def test_text_ingest_preserves_whitespace_for_files_and_url_fallback(self):
+        body = "  leading  \r\n\r\n\r\n trailing \t\r\n\r\n"
+        source = self.root / "source.txt"
+        source.write_bytes(body.encode("utf-8"))
+        with patch.object(second_brain, "convert_markitdown", return_value=None), \
+             patch.object(second_brain, "fetch_url", return_value=(body.encode("utf-8"), "text/plain")):
+            results = [second_brain.ingest(str(source)), second_brain.ingest("https://example.com/note.txt")]
+        for result in results:
+            captured = (self.root / result["raw"]).read_text(encoding="utf-8").split("---\n\n", 1)[1]
+            self.assertEqual(captured, body.replace("\r\n", "\n"))
+        with patch.object(second_brain, "convert_markitdown", return_value="reformatted"), \
+             patch.object(second_brain, "fetch_url", return_value=(body.encode("utf-8"), "text/html")):
+            result = second_brain.ingest("https://example.com/note.md")
+        captured = (self.root / result["raw"]).read_text(encoding="utf-8").split("---\n\n", 1)[1]
+        self.assertEqual(captured, body.replace("\r\n", "\n"))
+
+    def test_ingest_failure_restores_index_log_and_removes_only_created_files(self):
+        index = self.root / "index.md"
+        log = self.root / "log.md"
+        index.write_text("# Existing index\n", encoding="utf-8")
+        log.write_text("# Existing log\n", encoding="utf-8")
+        source = self.root / "picture.png"
+        source.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+        def partial_log(*args):
+            log.write_text("partial log\n", encoding="utf-8")
+            raise OSError("log failed")
+        with patch.object(second_brain, "_append_log", side_effect=partial_log):
+            with self.assertRaisesRegex(OSError, "log failed"):
+                second_brain.ingest(str(source))
+        self.assertEqual(index.read_text(encoding="utf-8"), "# Existing index\n")
+        self.assertEqual(log.read_text(encoding="utf-8"), "# Existing log\n")
+        self.assertEqual([path for path in self.raw.rglob("*") if path.is_file()], [])
+        with patch.object(second_brain, "front_matter", side_effect=ValueError("front matter failed")):
+            with self.assertRaisesRegex(ValueError, "front matter failed"):
+                second_brain.ingest(str(source))
+        self.assertEqual([path for path in self.raw.rglob("*") if path.is_file()], [])
+        first = second_brain.ingest(str(source))
+        assets = [path for path in (self.raw / "assets").rglob("*") if path.is_file()]
+        def partial_index(*args):
+            index.write_text("partial index\n", encoding="utf-8")
+            raise OSError("index failed")
+        index_before = index.read_bytes()
+        with patch.object(second_brain, "_update_index", side_effect=partial_index):
+            with self.assertRaisesRegex(OSError, "index failed"):
+                second_brain.ingest(str(source))
+        self.assertEqual([path for path in (self.raw / "assets").rglob("*") if path.is_file()], assets)
+        self.assertEqual(index.read_bytes(), index_before)
+        self.assertTrue((self.root / first["raw"]).exists())
+
+    def test_collection_waits_until_ingest_is_fully_committed(self):
+        source = self.root / "source.txt"
+        source.write_text("# Reading List\n\n- Book\n", encoding="utf-8")
+        started = threading.Event()
+        resume = threading.Event()
+        original_update = second_brain._update_index
+        def pause_update(*args):
+            started.set()
+            if not resume.wait(timeout=10):
+                raise TimeoutError("ingest was not released")
+            return original_update(*args)
+        with ThreadPoolExecutor(max_workers=2) as pool, \
+             patch.object(second_brain, "_update_index", side_effect=pause_update):
+            capture = pool.submit(second_brain.ingest, str(source))
+            try:
+                self.assertTrue(started.wait(timeout=10))
+                raw_file = next(self.raw.rglob("*.md"))
+                extraction = pool.submit(extract_collections, raw_file)
+                with self.assertRaises(TimeoutError):
+                    extraction.result(timeout=0.2)
+            finally:
+                resume.set()
+            result = capture.result(timeout=10)
+            extraction.result(timeout=10)
+        self.assertIn(result["raw"], (self.root / "index.md").read_text(encoding="utf-8"))
+        self.assertIn("- Book", (self.wiki / "collections" / "reading-list.md").read_text(encoding="utf-8"))
+
+    def test_ingest_waits_for_content_lock_before_reading_source(self):
+        source = self.root / "source.txt"
+        source.write_text("before", encoding="utf-8")
+        started = threading.Event()
+        def capture():
+            started.set()
+            return second_brain.ingest(str(source))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with second_brain.repository_lock("content"):
+                future = pool.submit(capture)
+                self.assertTrue(started.wait(timeout=10))
+                with self.assertRaises(TimeoutError):
+                    future.result(timeout=0.2)
+                source.write_text("after", encoding="utf-8")
+            result = future.result(timeout=10)
+        self.assertIn("after", (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_ingest_preparation_failure_closes_and_removes_reserved_capture(self):
         source = self.root / "source.md"
         source.write_text("[link](note.md)\n", encoding="utf-8")
-        with patch.object(second_brain, "rebase_markdown", side_effect=ValueError("cannot rebase")):
-            with self.assertRaisesRegex(ValueError, "cannot rebase"):
+        with patch.object(second_brain, "front_matter", side_effect=ValueError("cannot prepare")):
+            with self.assertRaisesRegex(ValueError, "cannot prepare"):
                 second_brain.ingest(str(source))
         self.assertEqual(list(self.raw.rglob("*.md")), [])
         self.assertFalse((self.root / "index.md").exists())
@@ -466,7 +593,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("```md\n[fenced](literal.md)\n```", raw)
         self.assertIn("    [indented](literal.md)", raw)
         self.assertIn("<div>[html](literal.md)</div>", raw)
-        self.assertIn("[real](../../sibling.md)", raw)
+        self.assertIn("[real](sibling.md)", raw)
 
     def test_collection_task_matches_without_provenance(self):
         collection = self.wiki / "collections" / "tasks.md"
@@ -893,13 +1020,11 @@ class ReviewRegressionTests(unittest.TestCase):
         inbox.mkdir()
         existing = inbox / "_download.html"
         existing.write_text("Keep this capture", encoding="utf-8")
-        barrier = threading.Barrier(2)
         paths = []
 
         def convert(path):
             paths.append(path)
             before = path.read_bytes()
-            barrier.wait(timeout=10)
             self.assertEqual(path.read_bytes(), before)
             return before.decode()
 

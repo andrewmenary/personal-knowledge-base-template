@@ -154,11 +154,15 @@ def image_extension(data: bytes) -> str:
 
 def append_log(operation: str, title: str, detail: str = ""):
     with repository_lock("log"):
-        if not LOG.exists():
-            LOG.write_text("# Operations Log\n", encoding="utf-8")
-        suffix = f" - {detail}" if detail else ""
-        with LOG.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n## [{utc_now()}] {operation} | {title}{suffix}\n")
+        _append_log(operation, title, detail)
+
+
+def _append_log(operation: str, title: str, detail: str = ""):
+    if not LOG.exists():
+        LOG.write_text("# Operations Log\n", encoding="utf-8")
+    suffix = f" - {detail}" if detail else ""
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n## [{utc_now()}] {operation} | {title}{suffix}\n")
 
 
 def repository_lock(name: str) -> FileLock:
@@ -168,6 +172,32 @@ def repository_lock(name: str) -> FileLock:
 
 
 def ingest(source: str, journal: bool = False) -> dict[str, str]:
+    with repository_lock("content"), repository_lock("index"), repository_lock("log"):
+        created = []
+        snapshots = {}
+        try:
+            return _ingest(source, journal, created, snapshots)
+        except BaseException as error:
+            cleanup_errors = []
+            for path, content in snapshots.items():
+                try:
+                    if content is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_bytes(content)
+                except OSError as cleanup_error:
+                    cleanup_errors.append(f"{path}: {cleanup_error}")
+            for path in reversed(created):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    cleanup_errors.append(f"{path}: {cleanup_error}")
+            if cleanup_errors:
+                raise RuntimeError(f"Ingest failed: {error}; rollback failed: {'; '.join(cleanup_errors)}") from error
+            raise
+
+
+def _ingest(source: str, journal: bool, created: list[Path], snapshots: dict[Path, bytes | None]) -> dict[str, str]:
     parsed = urlparse(source)
     is_url = parsed.scheme in {"http", "https"}
     year = datetime.now(timezone.utc).strftime("%Y")
@@ -184,20 +214,33 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
             destination = ASSETS / year / slug
             destination.mkdir(parents=True, exist_ok=True)
             asset = destination / f"{slug}-{sha[:12]}{suffix}"
-            asset.write_bytes(data)
+            store_image(asset, data, created)
             body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
-            with tempfile.TemporaryDirectory(prefix="second-brain-") as directory:
-                temp = Path(directory) / f"{uuid.uuid4().hex}{suffix or '.html'}"
-                temp.write_bytes(data)
-                converted = convert_markitdown(temp)
+            html_source = suffix in {".htm", ".html"} or (not suffix and "html" in (content_type or ""))
+            converted = None
+            text = None
+            if not html_source:
+                try:
+                    text = decode_text_fallback(data, suffix, f"Binary URL content: {source}")
+                except ValueError:
+                    pass
+            if text is None:
+                with tempfile.TemporaryDirectory(prefix="second-brain-") as directory:
+                    temp = Path(directory) / f"{uuid.uuid4().hex}{suffix or '.html'}"
+                    temp.write_bytes(data)
+                    converted = convert_markitdown(temp)
             if converted is None:
-                text = decode_text_fallback(data, suffix, f"Binary URL content: {source}")
-                if "html" in (content_type or "") or suffix in {".htm", ".html"}:
+                if text is None:
+                    text = decode_text_fallback(data, suffix, f"Binary URL content: {source}")
+                if html_source:
                     text = html.unescape(re.sub(r"<[^>]+>", " ", text))
                     text = re.sub(r"\s+", " ", text).strip()
-                converted = text
-            body = converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
+                    converted = text
+                else:
+                    body = text.replace("\r\n", "\n").replace("\r", "\n")
+            if converted is not None:
+                body = converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
     else:
         path = Path(source).expanduser()
         if not path.is_absolute():
@@ -213,16 +256,14 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
             destination = ASSETS / year / slug
             destination.mkdir(parents=True, exist_ok=True)
             asset = destination / f"{slug}-{sha[:12]}{suffix}"
-            asset.write_bytes(data)
+            store_image(asset, data, created)
             body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
             suffix = path.suffix.lower()
             if suffix in TEXT_SUFFIXES:
                 converted = decode_text_fallback(data, suffix, f"Binary source {path}")
                 converted = converted.replace("\r\n", "\n").replace("\r", "\n")
-                body = converted if suffix in {".md", ".markdown"} else (
-                    converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"
-                )
+                body = converted
             else:
                 converted = convert_markitdown(path)
                 if converted is None:
@@ -233,15 +274,9 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
     destination_dir = RAW / year
     destination_dir.mkdir(parents=True, exist_ok=True)
     source_type = "url" if is_url else "file"
-    if is_url:
-        rendered_body = gfm(body)
-    else:
-        if path.suffix.lower() in {".md", ".markdown"}:
-            rendered_body = body
-        elif path.suffix.lower() in TEXT_SUFFIXES:
-            rendered_body = gfm(body)
-        else:
-            rendered_body = gfm(body)
+    preserve_text = (is_url and suffix not in IMAGE_SUFFIXES and converted is None) or (
+        not is_url and path.suffix.lower() in TEXT_SUFFIXES)
+    rendered_body = body if preserve_text else gfm(body)
     sequence = 1
     while True:
         filename = f"{slug}.md" if sequence == 1 else f"{slug}-{sequence}.md"
@@ -251,10 +286,9 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
         except FileExistsError:
             sequence += 1
             continue
+        created.append(destination)
         try:
             with handle:
-                if not is_url and path.suffix.lower() in {".md", ".markdown"}:
-                    rendered_body = rebase_markdown(rendered_body, path, destination, rendered_body)
                 content = front_matter(title, source, source_type, sha, journal) + "\n\n" + rendered_body
                 handle.write(content)
         except BaseException:
@@ -262,9 +296,21 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
             raise
         break
     relative = destination.relative_to(ROOT).as_posix()
-    append_log("ingest", title, f"[{relative}]")
-    update_index(title, relative)
+    snapshots[INDEX] = INDEX.read_bytes() if INDEX.exists() else None
+    _update_index(title, relative, "## Raw sources")
+    snapshots[LOG] = LOG.read_bytes() if LOG.exists() else None
+    _append_log("ingest", title, f"[{relative}]")
     return {"title": title, "raw": relative}
+
+
+def store_image(asset: Path, data: bytes, created: list[Path]):
+    try:
+        with asset.open("xb") as handle:
+            created.append(asset)
+            handle.write(data)
+    except FileExistsError:
+        if asset.read_bytes() != data:
+            raise ValueError(f"Image asset collision: {asset}")
 
 
 def update_index(title: str, relative_source: str):
@@ -369,6 +415,52 @@ def task_identity(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
+def task_line(line: str):
+    match = re.match(r"^([ \t]*(?:[*=!^][ \t]*)*)(\[[ Xx><]\]|[+Xx><])(?:[ \t]+(.*?))?[ \t]*$", line)
+    if not match:
+        return None
+    indent = len(re.match(r"^[ \t]*", line).group().expandtabs(4))
+    description = match.group(3) or ""
+    complete = match.group(2) in {"X", "x", "[X]", "[x]"}
+    irrelevant = bool(re.fullmatch(r"~~.+?~~(?:\s+\(\[source\]\([^)]+\)\))*", description))
+    return indent, complete or irrelevant
+
+
+def validate_task_hierarchy(lines: list[str], line_number: int, status: str, protected: set[int], body_start: int):
+    current = task_line(lines[line_number].rstrip("\r\n"))
+    indent = current[0]
+    if status == "completed":
+        for number in range(line_number + 1, len(lines)):
+            if number in protected:
+                continue
+            line = lines[number].rstrip("\r\n")
+            if not line.strip():
+                continue
+            child_indent = len(re.match(r"^[ \t]*", line).group().expandtabs(4))
+            if child_indent <= indent:
+                break
+            child = task_line(line)
+            if child and not child[1]:
+                raise ValueError("cannot complete task with unfinished subtasks")
+    elif status in {"open", "scheduled", "migrated"}:
+        child_indent = indent
+        for number in range(line_number - 1, body_start - 1, -1):
+            if number in protected:
+                continue
+            line = lines[number].rstrip("\r\n")
+            if not line.strip():
+                continue
+            ancestor_indent = len(re.match(r"^[ \t]*", line).group().expandtabs(4))
+            if ancestor_indent >= child_indent:
+                continue
+            ancestor = task_line(line)
+            if ancestor is None:
+                break
+            if ancestor[1]:
+                raise ValueError("cannot make a subtask unfinished under a completed or irrelevant task")
+            child_indent = ancestor_indent
+
+
 def migrate_task(task: str, status: str, target: str | None = None, date: str | None = None) -> list[str]:
     with repository_lock("content"):
         return _migrate_task(task, status, target, date)
@@ -441,15 +533,16 @@ def _migrate_task(task: str, status: str, target: str | None, date: str | None) 
                     replacement += f" -> {target.strip()}"
                 replacement += sources
                 replacement += re.search(r"[ \t]*$", line).group()
-                matches.append((path, lines, line_number, replacement + ending))
+                matches.append((path, lines, line_number, replacement + ending, protected, body_start))
     if len(matches) > 1:
-        locations = ", ".join(f"{path.relative_to(ROOT).as_posix()}:{number + 1}" for path, _, number, _ in matches)
+        locations = ", ".join(f"{path.relative_to(ROOT).as_posix()}:{number + 1}" for path, _, number, _, _, _ in matches)
         raise ValueError(f"ambiguous task; multiple exact matches: {locations}")
     if not matches:
         raise ValueError(f"task not found: {task}")
     changed = []
     if matches:
-        path, lines, line_number, replacement = matches[0]
+        path, lines, line_number, replacement, protected, body_start = matches[0]
+        validate_task_hierarchy(lines, line_number, status, protected, body_start)
         lines[line_number] = replacement
         with path.open("w", encoding="utf-8", newline="") as handle:
             handle.write("".join(lines))

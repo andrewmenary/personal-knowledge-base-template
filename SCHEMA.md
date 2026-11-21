@@ -64,7 +64,7 @@ Custom signifiers must be recorded under `Custom signifiers` below before use.
 
 ### Indentation and completion
 
-Indented bullets are subtasks. A master task is complete only when all subtasks are complete or irrelevant.
+Indented bullets are subtasks. A master task is complete only when all descendant tasks are complete or irrelevant. The migration CLI rejects completing a master with unfinished descendants or making a subtask unfinished beneath a completed or irrelevant ancestor. Completing a final subtask does not automatically complete its master; the owner explicitly completes each task.
 
 ### Signifier routing
 
@@ -127,7 +127,7 @@ Image file extensions are derived from supported image content, not a URL suffix
 
 Local text input and URL text fallback after unsuccessful conversion accept only extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files. They require valid UTF-8 without binary control characters or recognized binary signatures, regardless of URL Content-Type. These checks are heuristic: arbitrary binary data that looks like printable UTF-8 cannot always be distinguished from text. Unsupported URL extensions require successful conversion; supported images use the image handling above.
 
-URL conversion uses operation-private temporary files, never fixed inbox filenames. Concurrent CLI ingests reserve distinct raw filenames and serialize index and operation-log updates using locks in the Git-ignored `.second-brain-locks/` directory. Collection extraction and task migration share the `content` lock across their complete read-modify-write operations. Other tools editing those files must use the same locks to coordinate; do not remove lock files while operations are running.
+Local UTF-8 text and Markdown, and valid non-HTML URL text, are captured without trimming, reformatting, or rebasing links; only line endings are normalized. Relative source links may therefore resolve differently or break in the raw capture; consult its original `source` for the original context. Generated or converted content may be normalized. URL conversion uses operation-private temporary files, never fixed inbox filenames. Ingest, collection extraction, and task migration share the `content` lock across their complete operations. Ingest also holds the index and log locks and rolls back its newly created capture, newly created image asset, and index/log writes on failure; a rollback error is reported explicitly. Concurrent CLI ingests reserve distinct raw filenames. Locks are stored in the Git-ignored `.second-brain-locks/` directory; other tools editing those files must use the same locks to coordinate, and lock files must not be removed while operations are running.
 
 ### Query
 
