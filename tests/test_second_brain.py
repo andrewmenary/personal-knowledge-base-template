@@ -25,6 +25,8 @@ from tools.second_brain import (
     save_query_output,
 )
 
+JOURNAL_HEADER = "---\nkind: journal\n---\n"
+
 
 class SecondBrainTests(unittest.TestCase):
     def setUp(self):
@@ -63,7 +65,7 @@ class SecondBrainTests(unittest.TestCase):
     def test_migration_updates_in_place(self):
         path = self.raw / "migration-test.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("+ Migrate this task\n", encoding="utf-8")
+        path.write_text(JOURNAL_HEADER + "+ Migrate this task\n", encoding="utf-8")
         try:
             changed = migrate_task("Migrate this task", "migrated", "September")
             self.assertIn("raw/migration-test.md", changed)
@@ -72,7 +74,7 @@ class SecondBrainTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
         scheduled = self.raw / "scheduled-test.md"
-        scheduled.write_text("+ Schedule this task\n", encoding="utf-8")
+        scheduled.write_text(JOURNAL_HEADER + "+ Schedule this task\n", encoding="utf-8")
         try:
             migrate_task("Schedule this task", "scheduled", date="2026-12-01")
             self.assertIn("< 2026-12-01 Schedule this task", scheduled.read_text(encoding="utf-8"))
@@ -126,10 +128,12 @@ class SecondBrainTests(unittest.TestCase):
             destination.unlink(missing_ok=True)
 
     def test_saved_query_links_are_relative(self):
+        source = self.wiki / "collections" / "tasks.md"
+        source.write_text("+ Ship\n", encoding="utf-8")
         output = save_query_output("tasks", [{"path": "wiki/collections/tasks.md", "line": "+ Ship"}])
         try:
             text = output.read_text(encoding="utf-8")
-            self.assertIn("](../../wiki/collections/tasks.md)", text)
+            self.assertIn("](../collections/tasks.md)", text)
         finally:
             output.unlink(missing_ok=True)
 
@@ -176,13 +180,13 @@ class ReviewRegressionTests(unittest.TestCase):
         ):
             with self.subTest(original=original):
                 source = self.raw / "journal.md"
-                source.write_text(original, encoding="utf-8")
+                source.write_text(JOURNAL_HEADER + original, encoding="utf-8")
                 migrate_task("task", "completed")
-                self.assertEqual(source.read_text(encoding="utf-8"), expected)
+                self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + expected)
 
     def test_scheduled_date_validation_before_any_write(self):
         source = self.raw / "journal.md"
-        original = "  * [ ] schedule task\n"
+        original = JOURNAL_HEADER + "  * [ ] schedule task\n"
         source.write_text(original, encoding="utf-8")
         for invalid in (None, "", "2026-2-03", "2026-02-29", "tomorrow", "2026-02-30"):
             with self.subTest(invalid=invalid):
@@ -191,7 +195,7 @@ class ReviewRegressionTests(unittest.TestCase):
                 self.assertEqual(source.read_text(encoding="utf-8"), original)
                 self.assertFalse((self.root / "log.md").exists())
         migrate_task("schedule task", "scheduled", date="2028-02-29")
-        self.assertEqual(source.read_text(encoding="utf-8"), "  * [<] 2028-02-29 schedule task\n")
+        self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + "  * [<] 2028-02-29 schedule task\n")
 
     def test_scheduled_cli_rejects_missing_and_invalid_date(self):
         source = self.raw / "journal.md"
@@ -210,6 +214,88 @@ class ReviewRegressionTests(unittest.TestCase):
                 self.assertIn("valid date", result.stderr)
                 self.assertEqual(source.read_text(encoding="utf-8"), original)
                 self.assertFalse((self.root / "log.md").exists())
+
+    def test_rescheduling_replaces_previous_date(self):
+        source = self.raw / "journal.md"
+        for marker in ("<", "[<]"):
+            with self.subTest(marker=marker):
+                source.write_text(JOURNAL_HEADER + f"  * {marker} 2026-11-20 task\n", encoding="utf-8")
+                migrate_task("task", "scheduled", date="2026-12-01")
+                self.assertEqual(source.read_text(encoding="utf-8"),
+                                 JOURNAL_HEADER + f"  * {marker} 2026-12-01 task\n")
+                migrate_task("task", "scheduled", date="2026-12-01")
+                self.assertEqual(source.read_text(encoding="utf-8"),
+                                 JOURNAL_HEADER + f"  * {marker} 2026-12-01 task\n")
+
+    def test_migration_only_changes_explicit_journals(self):
+        article = self.raw / "a-article.md"
+        unmarked = self.raw / "b-unmarked.md"
+        malformed = self.raw / "c-malformed.md"
+        journal = self.raw / "d-journal.md"
+        article.write_text("---\nkind: article\n---\n+ shared task\n", encoding="utf-8")
+        unmarked.write_text("+ shared task\n", encoding="utf-8")
+        malformed.write_text("---\nkind: [\n---\n+ shared task\n", encoding="utf-8")
+        journal.write_bytes(b"---\r\nkind: journal\r\n---\r\n+ shared task\r\n")
+        originals = {p: p.read_bytes() for p in (article, unmarked, malformed)}
+        self.assertEqual(migrate_task("shared task", "completed"), ["raw/d-journal.md"])
+        for path, original in originals.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), b"---\r\nkind: journal\r\n---\r\nX shared task\r\n")
+
+    def test_journal_ingest_sets_explicit_kind(self):
+        source = self.root / "capture.md"
+        source.write_text("+ task\n", encoding="utf-8")
+        with patch.object(second_brain, "convert_markitdown", return_value=None):
+            article = second_brain.ingest(str(source))
+            journal = second_brain.ingest(str(source), journal=True)
+        self.assertNotIn("kind", second_brain.parse_front_matter((self.root / article["raw"]).read_text()))
+        self.assertEqual(second_brain.parse_front_matter((self.root / journal["raw"]).read_text())["kind"], "journal")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "second_brain.py"), "ingest",
+             str(source), "--journal", "--json"], env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json
+        metadata = second_brain.parse_front_matter((self.root / json.loads(result.stdout)["raw"]).read_text())
+        self.assertEqual(metadata["kind"], "journal")
+
+    def test_collection_rebases_inline_and_reference_links(self):
+        source = self.raw / "2026" / "reading.md"
+        source.parent.mkdir()
+        (source.parent / "a (book).md").write_text("# Book\n", encoding="utf-8")
+        (source.parent / "cover image.png").write_bytes(b"image")
+        source.write_text(
+            "# Reading List\n\n"
+            "- [Book](<a (book).md#intro> \"title\") ![Cover][cover] [site](https://example.com)\n"
+            "- [reference][book] [section](#heading) and `[](missing.md)`\n\n"
+            "[cover]: <cover image.png>\n[book]: <a (book).md> \"Book title\"\n", encoding="utf-8")
+        extract_collections(source)
+        collection = self.wiki / "collections" / "reading-list.md"
+        result = collection.read_text(encoding="utf-8")
+        self.assertIn("../../raw/2026/a%20%28book%29.md#intro", result)
+        self.assertIn("![Cover](../../raw/2026/cover%20image.png)", result)
+        self.assertIn('[reference](../../raw/2026/a%20%28book%29.md "Book title")', result)
+        self.assertIn("[section](../../raw/2026/reading.md#heading)", result)
+        self.assertIn("[site](https://example.com)", result)
+        self.assertIn("`[](missing.md)`", result)
+        self.assertNotIn("[cover]:", result)
+        self.assertFalse([issue for issue in lint_links() if issue["path"] == "wiki/collections/reading-list.md"])
+        extract_collections(source)
+        self.assertEqual(collection.read_text(encoding="utf-8"), result)
+
+    def test_saved_query_escapes_paths_and_rebases_snippets(self):
+        source = self.wiki / "note (#one).md"
+        target = self.wiki / "linked file.md"
+        target.write_text("# Linked\n", encoding="utf-8")
+        source.write_text("[link][ref] ![img](<linked file.md#part>)\n\n[ref]: <linked file.md>\n", encoding="utf-8")
+        output = save_query_output("example", [{"path": "wiki/note (#one).md", "line": "[link][ref] ![img](<linked file.md#part>)"}])
+        text = output.read_text(encoding="utf-8")
+        self.assertIn("../note%20%28%23one%29.md", text)
+        self.assertIn("[link](../linked%20file.md)", text)
+        self.assertIn("![img](../linked%20file.md#part)", text)
+        self.assertFalse([issue for issue in lint_links() if issue["path"] == output.relative_to(self.root).as_posix()])
 
     def test_lint_reports_missing_or_malformed_source_metadata(self):
         digest = hashlib.sha256(b"original").hexdigest()

@@ -43,6 +43,7 @@ Raw source prose must never be edited. The sole exception is status mutation in 
 - use Markdown strikethrough for irrelevant tasks
 
 Never duplicate a migrated task across days. Update or relocate its canonical status.
+Only raw files explicitly marked with YAML `kind: journal` are eligible for CLI migration; missing or malformed front matter is never treated as a journal. Use `ingest <path> --journal` when ingesting a journal. Existing raw files without the marker remain immutable; an owner may explicitly classify a confirmed journal by adding this front-matter field before migration. Collections remain eligible for canonical task updates.
 
 ## Rapid logging
 
@@ -86,7 +87,7 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 
 Recognize reading lists, habits, shopping lists, goals, meeting notes, project spreads, and other recurring headings. Merge entries by stable identity into `wiki/collections/<slug>.md`. Preserve source links and do not treat collection entries as daily reflections.
 
-For automatic extraction, identity is the exact entry text with leading and trailing whitespace removed, including its Markdown bullet or task marker. Matching entries retain one line with a link for each source.
+For automatic extraction, identity is the entry text after rebasing Markdown destinations to the collection location and removing leading and trailing whitespace, including its Markdown bullet or task marker. Matching entries retain one line with a link for each source.
 
 ### OCR cleanup
 
@@ -116,7 +117,7 @@ aliases: {}
 
 `python tools/second_brain.py ingest <file-or-url>`
 
-The CLI reads text directly or uses MarkItDown when available. URLs are fetched and converted. Non-image binaries are converted to Markdown and the original is not stored under `raw/`. Images are stored under `raw/assets/`.
+The CLI reads text directly or uses MarkItDown when available. Add `--journal` only for a rapid-log journal. URLs are fetched and converted. Non-image binaries are converted to Markdown and the original is not stored under `raw/`. Images are stored under `raw/assets/`.
 
 Image file extensions are derived from supported image content, not a URL suffix. Unsupported or unrecognized image formats are rejected.
 

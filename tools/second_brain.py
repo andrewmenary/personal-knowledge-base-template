@@ -15,12 +15,13 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse, urlsplit
+from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import yaml
 from filelock import FileLock
 from markdown_it import MarkdownIt
+from markdown_it.rules_inline import image as image_rule, link as link_rule
 
 
 ROOT = Path(os.environ.get("SECOND_BRAIN_ROOT", Path(__file__).resolve().parents[1])).resolve()
@@ -60,7 +61,7 @@ def yaml_quote(value: object) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def front_matter(title: str, source: str, source_type: str, source_sha256: str) -> str:
+def front_matter(title: str, source: str, source_type: str, source_sha256: str, journal: bool = False) -> str:
     fields = [
         ("title", title),
         ("source", source),
@@ -71,6 +72,8 @@ def front_matter(title: str, source: str, source_type: str, source_sha256: str) 
         ("status", "active"),
         ("immutable", "true"),
     ]
+    if journal:
+        fields.append(("kind", "journal"))
     lines = ["---"]
     for key, value in fields:
         if key in {"tags", "immutable"}:
@@ -157,7 +160,7 @@ def repository_lock(name: str) -> FileLock:
     return FileLock(str(directory / f"{name}.lock"))
 
 
-def ingest(source: str) -> dict[str, str]:
+def ingest(source: str, journal: bool = False) -> dict[str, str]:
     parsed = urlparse(source)
     is_url = parsed.scheme in {"http", "https"}
     year = datetime.now(timezone.utc).strftime("%Y")
@@ -227,7 +230,7 @@ def ingest(source: str) -> dict[str, str]:
     destination_dir = RAW / year
     destination_dir.mkdir(parents=True, exist_ok=True)
     source_type = "url" if is_url else "file"
-    content = front_matter(title, source, source_type, sha) + "\n\n" + gfm(body)
+    content = front_matter(title, source, source_type, sha, journal) + "\n\n" + gfm(body)
     sequence = 1
     while True:
         filename = f"{slug}.md" if sequence == 1 else f"{slug}-{sequence}.md"
@@ -325,30 +328,52 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
             break
         if path.resolve() == LOG.resolve():
             continue
-        text = path.read_text(encoding="utf-8")
-        lines = text.splitlines()
+        if not (path.resolve().is_relative_to(RAW.resolve()) or
+                path.resolve().is_relative_to((WIKI / "collections").resolve())):
+            continue
+        with path.open(encoding="utf-8", newline="") as handle:
+            text = handle.read()
+        body_start = 0
+        if path.is_relative_to(RAW):
+            try:
+                metadata = parse_front_matter(text)
+            except ValueError:
+                continue
+            if metadata.get("kind") != "journal":
+                continue
+            body_start = text.splitlines().index("---", 1) + 1
+        lines = text.splitlines(keepends=True)
         output = []
-        for line in lines:
+        for line_number, original_line in enumerate(lines):
+            if line_number < body_start:
+                output.append(original_line)
+                continue
+            line = original_line.rstrip("\r\n")
+            ending = original_line[len(line):]
             parsed = parse_bullet(line)
             if not canonical_updated and needle and parsed["bullet"] in {" ", "+", ">", "<", "X", "x"} and needle in str(parsed["text"]).lower():
                 match = re.match(r"^([ \t]*(?:[*=!^][ \t]*)*)(\[[ Xx><]\]|[+Xx><])", line)
                 if match is None:
-                    output.append(line)
+                    output.append(original_line)
                     continue
                 marker = f"[{symbol if symbol != '+' else ' '}]" if match.group(2).startswith("[") else symbol
                 replacement = match.group(1) + marker + line[match.end():]
                 if status == "scheduled":
-                    replacement = match.group(1) + marker + " " + date + line[match.end():]
+                    remainder = line[match.end():]
+                    if parsed["bullet"] == "<":
+                        remainder = re.sub(r"^([ \t]+)\d{4}-\d{2}-\d{2}(?=[ \t]|$)", "", remainder, count=1)
+                    replacement = match.group(1) + marker + " " + date + remainder
                 elif status == "migrated" and target:
                     replacement += f" -> {target}"
-                output.append(replacement)
+                output.append(replacement + ending)
                 changed.append(path.relative_to(ROOT).as_posix())
                 canonical_updated = True
             else:
-                output.append(line)
-        new_text = "\n".join(output) + ("\n" if text.endswith("\n") else "")
+                output.append(original_line)
+        new_text = "".join(output)
         if new_text != text:
-            path.write_text(new_text, encoding="utf-8")
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(new_text)
     append_log("migration", task, f"status={status}; target={target or ''}")
     return sorted(set(changed))
 
@@ -365,14 +390,73 @@ def clean_ocr(text: str, aliases: dict[str, str] | None = None) -> str:
     return gfm(text)
 
 
+def rebase_link(target: str, source: Path, destination: Path) -> str:
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or parsed.path.startswith("/"):
+        return target
+    target_path = (source.parent / unquote(parsed.path)).resolve() if parsed.path else source.resolve()
+    relative = Path(os.path.relpath(target_path, destination.parent.resolve())).as_posix()
+    return urlunsplit(("", "", quote(relative, safe="/-._~"), parsed.query, parsed.fragment))
+
+
+def rebase_markdown(text: str, source: Path, destination: Path, source_text: str) -> str:
+    """Rebase Markdown links using the source document's reference definitions."""
+    parser = MarkdownIt("commonmark")
+    environment = {}
+    parser.parse(source_text, environment)
+    edits = []
+    for name, rule in (("link", link_rule), ("image", image_rule)):
+        def rebase_rule(state, silent, rule=rule, name=name):
+            start = state.pos
+            label_end = state.md.helpers.parseLinkLabel(state, start + (name == "image"), name == "link")
+            token_start = len(state.tokens)
+            success = rule(state, silent)
+            if not success or silent or state.src != text or label_end < 0:
+                return success
+            token = next((token for token in state.tokens[token_start:]
+                          if token.type == ("image" if name == "image" else "link_open")), None)
+            if token is None:
+                return success
+            target = token.attrGet("src" if name == "image" else "href")
+            rebased = rebase_link(target, source, destination)
+            if rebased == target:
+                return success
+            suffix_start = label_end + 1
+            if suffix_start < len(text) and text[suffix_start] == "(":
+                pos = suffix_start + 1
+                while pos < len(text) and text[pos] in " \t\n":
+                    pos += 1
+                parsed = state.md.helpers.parseLinkDestination(text, pos, len(text))
+                if parsed.ok:
+                    edits.append((pos, parsed.pos, rebased))
+            else:
+                title = token.attrGet("title")
+                title_part = f' "{title.replace(chr(34), "&quot;")}"' if title else ""
+                edits.append((suffix_start, state.pos, f"({rebased}{title_part})"))
+            return success
+
+        parser.inline.ruler.at(name, rebase_rule)
+    parser.inline.parse(text, parser, environment, [])
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def extract_collections(source: Path) -> list[dict[str, str]]:
     text = source.read_text(encoding="utf-8")
     resolved_source = source.resolve()
     if not resolved_source.is_relative_to(ROOT.resolve()):
         raise ValueError(f"Collection source must be inside the knowledge base: {source}")
+    parser = MarkdownIt("commonmark", {"inline_definitions": True})
+    definitions = set()
+    for token in parser.parse(text):
+        if token.type == "definition" and token.map:
+            definitions.update(range(*token.map))
     collections: dict[str, list[str]] = {}
     current = None
-    for line in text.splitlines():
+    for line_number, line in enumerate(text.splitlines()):
+        if line_number in definitions:
+            continue
         heading = COLLECTION_HEADINGS.match(line)
         if heading:
             current = slugify(heading.group(1))
@@ -406,6 +490,7 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
                 identities[identity] = len(lines)
             lines.append(line)
         for entry in entries:
+            entry = rebase_markdown(entry, resolved_source, destination, text)
             identity = entry.strip()
             if identity in identities:
                 index = identities[identity]
@@ -585,10 +670,12 @@ def save_query_output(terms: str, matches: list[dict[str, str]]) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{slugify(terms)}-{utc_now()[:10]}.md"
     lines = [f"# Query: {terms}", "", "## Results", ""]
-    lines.extend(
-        f"- [`{item['path']}`](../../{item['path']}) - {item['line']}"
-        for item in matches
-    )
+    for item in matches:
+        source = ROOT / item["path"]
+        target = quote(Path(os.path.relpath(source, destination.parent)).as_posix(), safe="/-._~")
+        label = "source"
+        snippet = rebase_markdown(item["line"], source, destination, source.read_text(encoding="utf-8"))
+        lines.append(f"- [{label}]({target}) - {snippet}")
     if not matches:
         lines.append("_No matching results._")
     destination.write_text(gfm("\n".join(lines)), encoding="utf-8")
@@ -601,6 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subcommands.add_parser("ingest")
     ingest.add_argument("source")
+    ingest.add_argument("--journal", action="store_true", help="Mark this source as a rapid-log journal")
     ingest.add_argument("--json", action="store_true")
 
     query = subcommands.add_parser("query")
@@ -632,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "ingest":
-            result = ingest(args.source)
+            result = ingest(args.source, journal=args.journal)
             print(json.dumps(result, indent=2) if args.json else f"Ingested: {result['raw']}")
             return 0
 
