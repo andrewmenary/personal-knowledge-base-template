@@ -471,41 +471,69 @@ def rebase_markdown(text: str, source: Path, destination: Path, source_text: str
     """Rebase Markdown links using the source document's reference definitions."""
     parser = MarkdownIt("commonmark")
     environment = {}
-    parser.parse(source_text, environment)
-    edits = []
-    for name, rule in (("link", link_rule), ("image", image_rule)):
-        def rebase_rule(state, silent, rule=rule, name=name):
-            start = state.pos
-            label_end = state.md.helpers.parseLinkLabel(state, start + (name == "image"), name == "link")
-            token_start = len(state.tokens)
-            success = rule(state, silent)
-            if not success or silent or state.src != text or label_end < 0:
-                return success
-            token = next((token for token in state.tokens[token_start:]
-                          if token.type == ("image" if name == "image" else "link_open")), None)
-            if token is None:
-                return success
-            target = token.attrGet("src" if name == "image" else "href")
-            rebased = rebase_link(target, source, destination)
-            if rebased == target:
-                return success
-            suffix_start = label_end + 1
-            if suffix_start < len(text) and text[suffix_start] == "(":
-                pos = suffix_start + 1
-                while pos < len(text) and text[pos] in " \t\n":
-                    pos += 1
-                parsed = state.md.helpers.parseLinkDestination(text, pos, len(text))
-                if parsed.ok:
-                    edits.append((pos, parsed.pos, rebased))
-            else:
-                title = token.attrGet("title")
-                title_part = f' "{title.replace(chr(34), "&quot;")}"' if title else ""
-                edits.append((suffix_start, state.pos, f"({rebased}{title_part})"))
-            return success
+    block_tokens = parser.parse(source_text, environment)
 
-        parser.inline.ruler.at(name, rebase_rule)
-    parser.inline.parse(text, parser, environment, [])
-    for start, end, replacement in sorted(edits, reverse=True):
+    def rebase_fragment(fragment: str) -> str:
+        parser_fragment = MarkdownIt("commonmark")
+        fragment_environment = dict(environment)
+        edits = []
+        for name, rule in (("link", link_rule), ("image", image_rule)):
+            def rebase_rule(state, silent, rule=rule, name=name):
+                start = state.pos
+                label_end = state.md.helpers.parseLinkLabel(
+                    state, start + (name == "image"), name == "link"
+                )
+                token_start = len(state.tokens)
+                success = rule(state, silent)
+                if not success or silent or state.src != fragment or label_end < 0:
+                    return success
+                token = next((token for token in state.tokens[token_start:]
+                              if token.type == ("image" if name == "image" else "link_open")), None)
+                if token is None:
+                    return success
+                target = token.attrGet("src" if name == "image" else "href")
+                rebased = rebase_link(target, source, destination)
+                if rebased == target:
+                    return success
+                suffix_start = label_end + 1
+                if suffix_start < len(fragment) and fragment[suffix_start] == "(":
+                    pos = suffix_start + 1
+                    while pos < len(fragment) and fragment[pos] in " \t\n":
+                        pos += 1
+                    parsed = state.md.helpers.parseLinkDestination(fragment, pos, len(fragment))
+                    if parsed.ok:
+                        edits.append((pos, parsed.pos, rebased))
+                else:
+                    title = token.attrGet("title")
+                    title_part = f' "{title.replace(chr(34), "&quot;")}"' if title else ""
+                    edits.append((suffix_start, state.pos, f"({rebased}{title_part})"))
+                return success
+
+            parser_fragment.inline.ruler.at(name, rebase_rule)
+        parser_fragment.inline.parse(fragment, parser_fragment, fragment_environment, [])
+        for start, end, replacement in sorted(edits, reverse=True):
+            fragment = fragment[:start] + replacement + fragment[end:]
+        return fragment
+
+    if text != source_text:
+        return rebase_fragment(text)
+
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    replacements = []
+    for token in block_tokens:
+        if token.type != "inline" or not token.map:
+            continue
+        start_line, end_line = token.map
+        start = offsets[start_line]
+        end = offsets[end_line]
+        fragment = text[start:end]
+        rebased = rebase_fragment(fragment)
+        if rebased != fragment:
+            replacements.append((start, end, rebased))
+    for start, end, replacement in sorted(replacements, reverse=True):
         text = text[:start] + replacement + text[end:]
     return text
 

@@ -416,6 +416,25 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("  + preserve indentation  \n\n[Sibling](../../sibling.md)\n![Image](../../images/pixel.png)", raw)
         self.assertNotIn("trimmed", raw)
 
+    def test_markdown_ingest_preserves_links_in_code_and_html(self):
+        source = self.root / "blocks.md"
+        source.write_text(
+            "`[inline](literal.md)`\n\n"
+            "```md\n[fenced](literal.md)\n```\n\n"
+            "    [indented](literal.md)\n\n"
+            "<div>[html](literal.md)</div>\n\n"
+            "[real](sibling.md)\n",
+            encoding="utf-8",
+        )
+        (self.root / "sibling.md").write_text("# Sibling\n", encoding="utf-8")
+        result = second_brain.ingest(str(source))
+        raw = (self.root / result["raw"]).read_text(encoding="utf-8")
+        self.assertIn("`[inline](literal.md)`", raw)
+        self.assertIn("```md\n[fenced](literal.md)\n```", raw)
+        self.assertIn("    [indented](literal.md)", raw)
+        self.assertIn("<div>[html](literal.md)</div>", raw)
+        self.assertIn("[real](../../sibling.md)", raw)
+
     def test_collection_task_matches_without_provenance(self):
         collection = self.wiki / "collections" / "tasks.md"
         collection.parent.mkdir()
