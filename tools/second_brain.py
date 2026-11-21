@@ -32,8 +32,11 @@ INBOX = ROOT / "inbox"
 INDEX = ROOT / "index.md"
 LOG = ROOT / "log.md"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg"}
-TEXT_TYPES = {"text/", "application/json", "application/xml", "application/yaml", "application/javascript"}
 TEXT_SUFFIXES = {"", ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".html", ".htm"}
+BINARY_SIGNATURES = (b"%PDF-", b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",
+                     b"\x1f\x8b", b"\x7fELF", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
+                     b"SQLite format 3\x00", b"Rar!\x1a\x07", b"GIF87a", b"GIF89a",
+                     b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
 COLLECTION_HEADINGS = re.compile(
     r"^#{1,3}\s+(reading list|habit tracker|shopping list|meeting notes|"
     r"project spread|personal goals|goals|collection|book list|watch list)\b",
@@ -110,12 +113,16 @@ def convert_markitdown(path: Path) -> str | None:
         return None
 
 
-def convert_markitdown_available() -> bool:
+def decode_text_fallback(data: bytes, suffix: str, label: str) -> str:
+    if suffix not in TEXT_SUFFIXES or data.startswith(BINARY_SIGNATURES):
+        raise ValueError(f"{label} requires MarkItDown conversion")
     try:
-        __import__("markitdown")
-        return True
-    except Exception:
-        return False
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} requires MarkItDown conversion") from exc
+    if any(ord(char) < 32 and char not in "\t\r\n" for char in text) or "\x7f" in text:
+        raise ValueError(f"{label} requires MarkItDown conversion")
+    return text
 
 
 def fetch_url(url: str) -> tuple[bytes, str]:
@@ -167,7 +174,7 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
 
     if is_url:
         data, content_type = fetch_url(source)
-        name = Path(parsed.path).name or "web-source"
+        name = Path(unquote(parsed.path)).name or "web-source"
         suffix = Path(name).suffix.lower()
         title = re.sub(r"[-_]+", " ", Path(name).stem).strip().title() or "Web Source"
         sha = hashlib.sha256(data).hexdigest()
@@ -180,18 +187,13 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
             asset.write_bytes(data)
             body = f"# {title}\n\n![{title}](../assets/{year}/{slug}/{asset.name})\n"
         else:
-            if content_type and not any(content_type.startswith(prefix) for prefix in TEXT_TYPES):
-                if not convert_markitdown_available():
-                    raise ValueError(f"Binary URL content requires MarkItDown: {source}")
             with tempfile.TemporaryDirectory(prefix="second-brain-") as directory:
                 temp = Path(directory) / f"{uuid.uuid4().hex}{suffix or '.html'}"
                 temp.write_bytes(data)
                 converted = convert_markitdown(temp)
             if converted is None:
-                if content_type and not any(content_type.startswith(prefix) for prefix in TEXT_TYPES):
-                    raise ValueError(f"Binary URL content could not be converted: {source}")
-                text = data.decode("utf-8", errors="replace")
-                if "html" in content_type or suffix in {".htm", ".html"}:
+                text = decode_text_fallback(data, suffix, f"Binary URL content: {source}")
+                if "html" in (content_type or "") or suffix in {".htm", ".html"}:
                     text = html.unescape(re.sub(r"<[^>]+>", " ", text))
                     text = re.sub(r"\s+", " ", text).strip()
                 converted = text
@@ -216,14 +218,7 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
         else:
             suffix = path.suffix.lower()
             if suffix in TEXT_SUFFIXES:
-                if data.startswith((b"%PDF-", b"PK\x03\x04")):
-                    raise ValueError(f"Binary source requires MarkItDown: {path}")
-                try:
-                    converted = data.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise ValueError(f"Binary source requires MarkItDown: {path}") from exc
-                if any(ord(char) < 32 and char not in "\t\r\n" for char in converted) or "\x7f" in converted:
-                    raise ValueError(f"Binary source requires MarkItDown: {path}")
+                converted = decode_text_fallback(data, suffix, f"Binary source {path}")
                 converted = converted.replace("\r\n", "\n").replace("\r", "\n")
                 body = converted if suffix in {".md", ".markdown"} else (
                     converted if converted.lstrip().startswith("#") else f"# {title}\n\n{converted}"

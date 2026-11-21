@@ -125,7 +125,7 @@ The CLI reads text directly or uses MarkItDown when available. Add `--journal` o
 
 Image file extensions are derived from supported image content, not a URL suffix. Unsupported or unrecognized image formats are rejected.
 
-Without a successful conversion, local text fallback accepts extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files, provided their UTF-8 content has no binary control characters.
+Local text input and URL text fallback after unsuccessful conversion accept only extensionless files and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv`, `.json`, `.xml`, `.yaml`, `.yml`, `.html`, or `.htm` files. They require valid UTF-8 without binary control characters or recognized binary signatures, regardless of URL Content-Type. These checks are heuristic: arbitrary binary data that looks like printable UTF-8 cannot always be distinguished from text. Unsupported URL extensions require successful conversion; supported images use the image handling above.
 
 URL conversion uses operation-private temporary files, never fixed inbox filenames. Concurrent CLI ingests reserve distinct raw filenames and serialize index and operation-log updates using locks in the Git-ignored `.second-brain-locks/` directory. Collection extraction and task migration share the `content` lock across their complete read-modify-write operations. Other tools editing those files must use the same locks to coordinate; do not remove lock files while operations are running.
 

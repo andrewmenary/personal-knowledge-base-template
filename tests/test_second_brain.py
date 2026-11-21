@@ -5,6 +5,7 @@ import os
 import hashlib
 import sys
 import threading
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -741,6 +742,54 @@ class ReviewRegressionTests(unittest.TestCase):
             self.assertIn("A normal note", (self.root / result["raw"]).read_text(encoding="utf-8"))
         with patch.object(second_brain, "convert_markitdown", return_value="# Converted PDF"):
             result = second_brain.ingest(str(self.root / "document.pdf"))
+            self.assertIn("Converted PDF", (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_url_text_fallback_rejects_binary_despite_missing_or_text_headers(self):
+        samples = (
+            ("https://example.com/a.txt", b"hello\x00world", "text/plain"),
+            ("https://example.com/a.txt", b"hello\x7fworld", "text/plain"),
+            ("https://example.com/a", b"\xff\xfe", ""),
+            ("https://example.com/a.md", b"%PDF-1.0\nplain text", "text/plain"),
+            ("https://example.com/a.txt", b"PK\x03\x04valid text", "text/html"),
+            ("https://example.com/a.bin", b"valid utf-8", ""),
+            ("https://example.com/a.pdf", b"valid utf-8", "text/plain"),
+            ("https://example.com/a%2Epdf", b"valid utf-8", "text/plain"),
+        )
+        index = self.root / "index.md"
+        log = self.root / "log.md"
+        index.write_text("# Existing index\n", encoding="utf-8")
+        log.write_text("# Existing log\n", encoding="utf-8")
+        with patch.object(second_brain, "convert_markitdown", return_value=None):
+            for url, data, content_type in samples:
+                with self.subTest(url=url, data=data), \
+                     patch.object(second_brain, "fetch_url", return_value=(data, content_type)):
+                    with self.assertRaisesRegex(ValueError, "Binary URL"):
+                        second_brain.ingest(url)
+                    self.assertEqual(list(self.raw.rglob("*.md")), [])
+                    self.assertEqual(index.read_text(encoding="utf-8"), "# Existing index\n")
+                    self.assertEqual(log.read_text(encoding="utf-8"), "# Existing log\n")
+
+    def test_url_text_fallback_accepts_valid_utf8_with_missing_headers(self):
+        with patch.object(second_brain, "convert_markitdown", return_value=None):
+            for content_type in ("", "application/octet-stream", "text/plain"):
+                with self.subTest(content_type=content_type), \
+                     patch.object(second_brain, "fetch_url", return_value=("Café\n".encode(), content_type)):
+                    result = second_brain.ingest("https://example.com/notes.txt")
+                    self.assertIn("Café", (self.root / result["raw"]).read_text(encoding="utf-8"))
+
+    def test_url_conversion_failure_validates_bytes_and_success_is_preserved(self):
+        class FailingConverter:
+            def convert(self, path):
+                raise RuntimeError("conversion failed")
+
+        with patch.dict(sys.modules, {"markitdown": SimpleNamespace(MarkItDown=FailingConverter)}), \
+             patch.object(second_brain, "fetch_url", return_value=(b"hello\x00world", "text/plain")):
+            with self.assertRaisesRegex(ValueError, "Binary URL"):
+                second_brain.ingest("https://example.com/broken.txt")
+            self.assertEqual(list(self.raw.rglob("*.md")), [])
+        with patch.object(second_brain, "fetch_url", return_value=(b"%PDF-\x00", "")), \
+             patch.object(second_brain, "convert_markitdown", return_value="# Converted PDF"):
+            result = second_brain.ingest("https://example.com/document.pdf")
             self.assertIn("Converted PDF", (self.root / result["raw"]).read_text(encoding="utf-8"))
 
     def test_url_staging_is_unique_and_preserves_inbox(self):
