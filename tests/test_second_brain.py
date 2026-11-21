@@ -576,6 +576,102 @@ class ReviewRegressionTests(unittest.TestCase):
         extract_collections(source)
         self.assertEqual(collection.read_text(encoding="utf-8"), result)
 
+    def test_collection_rebases_multiline_links_without_touching_nested_code(self):
+        source = self.raw / "reading.md"
+        (self.raw / "book.md").write_text("# Book\n", encoding="utf-8")
+        source.write_text(
+            "# Reading List\n\n"
+            "- [A\n  book](book.md)\n"
+            "  and [another](book.md)\n\n"
+            "  [destination](\n  book.md)\n\n"
+            "  [reference\n  label][book]\n\n"
+            "  ```md\n  [literal](book.md)\n  ```\n",
+            encoding="utf-8",
+        )
+        with source.open("a", encoding="utf-8") as handle:
+            handle.write("\n[book]: book.md\n")
+        extract_collections(source)
+        destination = self.wiki / "collections" / "reading-list.md"
+        result = destination.read_text(encoding="utf-8")
+        self.assertIn("[A\n  book](../../raw/book.md)", result)
+        self.assertIn("[another](../../raw/book.md)", result)
+        self.assertIn("[destination](\n  ../../raw/book.md)", result)
+        self.assertIn("[reference\n  label](../../raw/book.md)", result)
+        self.assertIn("  [literal](book.md)", result)
+        extract_collections(source)
+        self.assertEqual(destination.read_text(encoding="utf-8"), result)
+
+    def test_collection_deduplicates_single_line_paragraphs(self):
+        first = self.raw / "first.md"
+        second = self.raw / "second.md"
+        for source in (first, second):
+            source.write_text("# Reading List\n\nA prose book.\n", encoding="utf-8")
+            extract_collections(source)
+        destination = self.wiki / "collections" / "reading-list.md"
+        result = destination.read_text(encoding="utf-8")
+        self.assertEqual(result.count("A prose book."), 1)
+        self.assertIn("../../raw/first.md", result)
+        self.assertIn("../../raw/second.md", result)
+        extract_collections(first)
+        self.assertEqual(destination.read_text(encoding="utf-8"), result)
+
+    def test_collection_index_ignores_example_heading_and_link_in_code(self):
+        source = self.raw / "reading.md"
+        source.write_text("# Reading List\n\n- Book\n", encoding="utf-8")
+        index = self.root / "index.md"
+        index.write_text(
+            "# Index\n\n```md\n## Collections\n\n"
+            "- [Reading List](wiki/collections/reading-list.md)\n```\n",
+            encoding="utf-8",
+        )
+        extract_collections(source)
+        tokens = second_brain.MarkdownIt("commonmark").parse(index.read_text(encoding="utf-8"))
+        links = [child.attrGet("href") for token in tokens if token.children
+                 for child in token.children if child.type == "link_open"]
+        self.assertIn("wiki/collections/reading-list.md", links)
+
+    def test_collection_index_encodes_target_and_preserves_existing_content(self):
+        destination = self.wiki / "collections" / "reading (é).md"
+        destination.parent.mkdir(parents=True)
+        destination.write_text("# Reading\n", encoding="utf-8")
+        index = self.root / "index.md"
+        index.write_text("# Index\n\n## Collections\n\nExisting text.\n", encoding="utf-8")
+        second_brain.update_collection_index("reading", destination)
+        text = index.read_text(encoding="utf-8")
+        self.assertIn("(wiki/collections/reading%20%28%C3%A9%29.md)", text)
+        self.assertIn("Existing text.", text)
+        self.assertEqual(lint_links(), [])
+        second_brain.update_collection_index("reading", destination)
+        self.assertEqual(index.read_text(encoding="utf-8"), text)
+
+    def test_collection_single_line_code_block_remains_code_and_deduplicates(self):
+        for name in ("first", "second"):
+            source = self.raw / f"{name}.md"
+            source.write_text("# Reading List\n\n    [literal](book.md)\n", encoding="utf-8")
+            extract_collections(source)
+        destination = self.wiki / "collections" / "reading-list.md"
+        result = destination.read_text(encoding="utf-8")
+        tokens = second_brain.MarkdownIt("commonmark").parse(result)
+        self.assertEqual([token.content for token in tokens if token.type == "code_block"],
+                         ["[literal](book.md)\n"])
+        self.assertIn("../../raw/first.md", result)
+        self.assertIn("../../raw/second.md", result)
+
+    def test_collection_rebases_table_links_but_not_html_block_content(self):
+        source = self.raw / "reading.md"
+        source.write_text(
+            "# Reading List\n\n"
+            "| Book | Link |\n| --- | --- |\n| One | [book](book.md) |\n\n"
+            "<div>\n[literal](book.md)\n</div>\n",
+            encoding="utf-8",
+        )
+        extract_collections(source)
+        destination = self.wiki / "collections" / "reading-list.md"
+        result = destination.read_text(encoding="utf-8")
+        self.assertIn("| One | [book](../../raw/book.md) |", result)
+        self.assertIn("<div>\n[literal](book.md)\n</div>", result)
+        self.assertEqual(result.count("([source](../../raw/reading.md))"), 2)
+
     def test_saved_query_escapes_paths_and_rebases_snippets(self):
         source = self.wiki / "note (#one).md"
         target = self.wiki / "linked file.md"
@@ -939,6 +1035,33 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         for name in ("first", "second", "third"):
             self.assertIn(f"../../raw/{name}.md", entries[0])
+
+    def test_collection_merges_preexisting_duplicate_managed_blocks(self):
+        source = self.raw / "first.md"
+        source.write_text("# Reading List\n\n> Shared\n> quote\n", encoding="utf-8")
+        extract_collections(source)
+        destination = self.wiki / "collections" / "reading-list.md"
+        original = destination.read_text(encoding="utf-8")
+        block = original[original.index("<!-- collection-entry:"):]
+        duplicate = block.replace("../../raw/first.md", "../../raw/second.md")
+        destination.write_text(original + "\n" + duplicate, encoding="utf-8")
+        extract_collections(source)
+        result = destination.read_text(encoding="utf-8")
+        self.assertEqual(result.count("> Shared"), 1)
+        self.assertIn("../../raw/first.md", result)
+        self.assertIn("../../raw/second.md", result)
+
+    def test_collection_does_not_merge_managed_block_example_inside_code(self):
+        source = self.raw / "first.md"
+        source.write_text("# Reading List\n\n> Shared\n> quote\n", encoding="utf-8")
+        extract_collections(source)
+        destination = self.wiki / "collections" / "reading-list.md"
+        original = destination.read_text(encoding="utf-8")
+        block = original[original.index("<!-- collection-entry:"):]
+        example = "```text\n" + block + "```\n"
+        destination.write_text(original + "\n" + example, encoding="utf-8")
+        extract_collections(source)
+        self.assertIn(example, destination.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

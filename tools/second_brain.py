@@ -274,13 +274,32 @@ def update_index(title: str, relative_source: str):
 
 def _update_index(title: str, relative_source: str, section: str):
     text = INDEX.read_text(encoding="utf-8") if INDEX.exists() else "# Knowledge Index\n"
-    link = f"- [{title}]({relative_source})"
-    if link not in text:
-        if section in text:
-            text = text.replace(section, section + "\n\n" + link)
-        else:
-            text = text.rstrip() + "\n\n" + section + "\n\n" + link
-        INDEX.write_text(gfm(text), encoding="utf-8")
+    target = quote(relative_source, safe="/-._~")
+    escaped_title = re.sub(r"([\\\[\]])", r"\\\1", title)
+    link = f"- [{escaped_title}]({target})"
+    tokens = MarkdownIt("commonmark").parse(text)
+    section_start = None
+    in_section = False
+    for index, token in enumerate(tokens):
+        if token.type == "heading_open" and token.level == 0:
+            if token.tag in {"h1", "h2"}:
+                in_section = token.tag == "h2" and tokens[index + 1].content == section[3:]
+                if in_section and section_start is None:
+                    section_start = token.map[1]
+        if in_section and token.children:
+            if any(child.type == "link_open" and child.attrGet("href") == target
+                   for child in token.children):
+                return
+    if section_start is None:
+        separator = "\n" if text.endswith("\n") else "\n\n"
+        text += separator + section + "\n\n" + link + "\n"
+    else:
+        lines = text.splitlines(keepends=True)
+        if section_start and not lines[section_start - 1].endswith(("\n", "\r")):
+            lines[section_start - 1] += "\n"
+        lines.insert(section_start, "\n" + link + "\n")
+        text = "".join(lines)
+    INDEX.write_text(text, encoding="utf-8")
 
 
 def update_collection_index(name: str, destination: Path):
@@ -464,7 +483,8 @@ def rebase_markdown(text: str, source: Path, destination: Path, source_text: str
     """Rebase Markdown links using the source document's reference definitions."""
     parser = MarkdownIt("commonmark")
     environment = {}
-    block_tokens = parser.parse(source_text, environment)
+    parser.parse(source_text, environment)
+    block_tokens = parser.parse(text)
 
     def rebase_fragment(fragment: str) -> str:
         parser_fragment = MarkdownIt("commonmark")
@@ -508,9 +528,6 @@ def rebase_markdown(text: str, source: Path, destination: Path, source_text: str
             fragment = fragment[:start] + replacement + fragment[end:]
         return fragment
 
-    if text != source_text:
-        return rebase_fragment(text)
-
     lines = text.splitlines(keepends=True)
     offsets = [0]
     for line in lines:
@@ -544,11 +561,7 @@ def _extract_collections(source: Path) -> list[dict[str, str]]:
     parser = MarkdownIt("commonmark", {"inline_definitions": True}).enable("table")
     tokens = parser.parse(text)
     source_lines = text.splitlines()
-    protected = set()
-    for token in tokens:
-        if token.type in {"fence", "code_block", "html_block"} and token.map:
-            protected.update(range(*token.map))
-    collections: dict[str, list[str]] = {}
+    collections: dict[str, list[tuple[int, int, str]]] = {}
     current = None
     for token in tokens:
         if token.type == "heading_open" and token.level == 0:
@@ -565,7 +578,7 @@ def _extract_collections(source: Path) -> list[dict[str, str]]:
         }
         if is_item or is_block:
             start, end = token.map
-            collections[current].append((start, end))
+            collections[current].append((start, end, token.type))
 
     results = []
     for name, entries in collections.items():
@@ -578,25 +591,47 @@ def _extract_collections(source: Path) -> list[dict[str, str]]:
             r"(?ms)^<!-- collection-entry:([0-9a-f]{64}) -->\n(.*?)\n"
             r"((?:\(\[source\]\([^)]+\)\)(?: |\n|$))+)\n<!-- /collection-entry -->"
         )
-        block_matches = list(block_pattern.finditer(existing))
-        blocks = {}
-        edits = {}
-        additions = []
-        for match in block_matches:
-            entry = match.group(2).rstrip("\n")
-            digest = hashlib.sha256(entry.strip().encode("utf-8")).hexdigest()
-            if digest == match.group(1):
-                blocks[entry.strip()] = match
-        provenance = re.compile(r"(?:\s+\(\[source\]\([^)]+\)\))+$")
-        annotation = re.compile(r"\(\[source\]\([^)]+\)\)")
-        identities = {}
         existing_lines = existing.splitlines(keepends=True)
         offsets = [0]
         for line in existing_lines:
             offsets.append(offsets[-1] + len(line))
         existing_tokens = parser.parse(existing)
+        html_starts = {offsets[token.map[0]] for token in existing_tokens
+                       if token.type == "html_block" and token.level == 0 and token.map}
+        end_marker = "<!-- /collection-entry -->"
+        block_matches = [
+            match for match in block_pattern.finditer(existing)
+            if match.start() in html_starts and match.end() - len(end_marker) in html_starts
+        ]
+        blocks = {}
+        edits = {}
+        additions = []
+        annotation = re.compile(r"\(\[source\]\([^)]+\)\)")
+        for match in block_matches:
+            entry = match.group(2).rstrip("\n")
+            digest = hashlib.sha256(entry.strip().encode("utf-8")).hexdigest()
+            if digest == match.group(1):
+                identity = entry.strip()
+                if identity in blocks:
+                    previous = blocks[identity]
+                    key = (previous.start(), previous.end())
+                    block = edits.get(key, previous.group())
+                    end_marker = "\n<!-- /collection-entry -->"
+                    sources = annotation.findall(block_pattern.fullmatch(block).group(3))
+                    for link in annotation.findall(match.group(3)):
+                        if link not in sources:
+                            block = block[:-len(end_marker)] + f" {link}" + end_marker
+                            sources.append(link)
+                    edits[key] = block
+                    edits[(match.start(), match.end())] = ""
+                else:
+                    blocks[identity] = match
+        provenance = re.compile(r"(?:\s+\(\[source\]\([^)]+\)\))+$")
+        identities = {}
         for token in existing_tokens:
-            if token.type != "list_item_open" or token.level != 1 or not token.map:
+            is_item = token.type == "list_item_open" and token.level == 1
+            is_paragraph = token.type == "paragraph_open" and token.level == 0
+            if not (is_item or is_paragraph) or not token.map:
                 continue
             start, end = token.map
             meaningful = [i for i in range(start, end) if existing_lines[i].strip()]
@@ -622,23 +657,19 @@ def _extract_collections(source: Path) -> list[dict[str, str]]:
                 edits[(start_offset, end_offset)] = ""
             elif identity not in identities:
                 identities[identity] = (start_offset, end_offset)
-        for start, end in entries:
-            entry = "\n".join(
-                source_lines[line] if line in protected else
-                rebase_markdown(source_lines[line], resolved_source, destination, text)
-                for line in range(start, end)
-            ).strip("\n")
+        for start, end, entry_type in entries:
+            entry = rebase_markdown("\n".join(source_lines[start:end]), resolved_source, destination, text).strip("\n")
             identity = entry.strip()
             if not identity:
                 continue
-            if "\n" in identity:
+            if "\n" in identity or entry_type in {"fence", "code_block", "blockquote_open", "table_open", "html_block"}:
                 if identity in blocks:
                     match = blocks[identity]
                     if match is None:
                         continue
                     key = (match.start(), match.end())
                     block = edits.get(key, match.group())
-                    if source_annotation not in block:
+                    if source_annotation not in annotation.findall(block_pattern.fullmatch(block).group(3)):
                         end_marker = "\n<!-- /collection-entry -->"
                         block = block[:-len(end_marker)] + f" {source_annotation}" + end_marker
                         edits[key] = block

@@ -11,3 +11,5 @@ Chronological append-only operation history.
 ## [2026-11-21T07:23:20Z] maintenance | Clean up failed raw capture preparation
 
 ## [2026-11-21T07:49:37Z] maintenance | Validate URL text fallback before capture
+
+## [2026-11-21T08:00:22Z] maintenance | Preserve collection identities and multiline links
