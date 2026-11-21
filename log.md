@@ -15,3 +15,5 @@ Chronological append-only operation history.
 ## [2026-11-21T08:00:22Z] maintenance | Preserve collection identities and multiline links
 
 ## [2026-11-21T08:23:21Z] maintenance | Enforce task hierarchy and protect ingest integrity
+
+## [2026-11-21T08:38:15Z] maintenance | Harden lint scans and index labels

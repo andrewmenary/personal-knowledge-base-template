@@ -863,6 +863,116 @@ class ReviewRegressionTests(unittest.TestCase):
         path.write_text("---\n" + yaml.safe_dump(base) + "---\n", encoding="utf-8")
         self.assertEqual(lint_source_drift(), [])
 
+    def test_lint_continues_after_unreadable_or_invalid_markdown(self):
+        broken = self.raw / "broken.md"
+        broken.write_bytes(b"\xff")
+        denied_raw = self.raw / "denied.md"
+        denied_raw.write_text("unreadable", encoding="utf-8")
+        unavailable = self.wiki / "unavailable.md"
+        unavailable.write_text("unreadable", encoding="utf-8")
+        missing = self.wiki / "missing.md"
+        missing.write_text("disappeared", encoding="utf-8")
+        good = self.wiki / "good.md"
+        good.write_text("[bad](absent.md)\n", encoding="utf-8")
+        original_read = Path.read_text
+        def selective_read(path, *args, **kwargs):
+            if path in {unavailable, denied_raw}:
+                raise PermissionError("access denied")
+            if path == missing:
+                raise FileNotFoundError("disappeared")
+            return original_read(path, *args, **kwargs)
+        with patch.object(Path, "read_text", selective_read):
+            links = lint_links()
+            drift = lint_source_drift()
+            orphans = lint_orphans()
+        for issues in (links, orphans):
+            for name in ("raw/broken.md", "raw/denied.md", "wiki/unavailable.md", "wiki/missing.md"):
+                self.assertTrue(any(item["path"] == name and item.get("issue") for item in issues), (name, issues))
+        self.assertTrue(any(item["path"] == "wiki/good.md" and item.get("target") == "absent.md" for item in links))
+        self.assertTrue(any(item["path"] == "raw/broken.md" and item.get("issue") for item in drift))
+        self.assertTrue(any(item["path"] == "raw/denied.md" and item.get("issue") for item in drift))
+
+    def test_lint_source_drift_reports_directory_and_read_errors(self):
+        for name, source in (("directory", self.root), ("denied", self.root / "denied.txt"),
+                             ("vanished", self.root / "vanished.txt")):
+            (self.raw / f"{name}.md").write_text(
+                second_brain.front_matter(name, str(source), "file", "0" * 64), encoding="utf-8")
+        denied = self.root / "denied.txt"
+        denied.write_text("source", encoding="utf-8")
+        original_read = Path.read_bytes
+        def selective_read(path):
+            if path == denied:
+                raise PermissionError("access denied")
+            if path.name == "vanished.txt":
+                raise FileNotFoundError("disappeared")
+            return original_read(path)
+        with patch.object(Path, "read_bytes", selective_read):
+            issues = lint_source_drift()
+        self.assertEqual({issue["path"] for issue in issues},
+                         {"raw/directory.md", "raw/denied.md", "raw/vanished.md"})
+        self.assertTrue(all(issue["issue"] for issue in issues))
+
+    def test_orphan_scan_reports_page_resolution_errors(self):
+        broken = self.wiki / "broken.md"
+        broken.write_text("unavailable", encoding="utf-8")
+        original_resolve = Path.resolve
+        def selective_resolve(path, *args, **kwargs):
+            if path == broken:
+                raise OSError("cannot resolve page")
+            return original_resolve(path, *args, **kwargs)
+        with patch.object(Path, "resolve", selective_resolve):
+            issues = lint_orphans()
+        self.assertTrue(any(item["path"] == "wiki/broken.md" and "cannot inspect page" in item.get("issue", "")
+                            for item in issues))
+
+    def test_lint_cli_reports_invalid_and_directory_markdown_without_aborting(self):
+        (self.raw / "bad.md").write_bytes(b"\xff")
+        (self.raw / "directory.md").mkdir()
+        (self.wiki / "good.md").write_text("[bad](absent.md)\n", encoding="utf-8")
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "second_brain.py"), "lint", "--json"],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        import json
+        issues = json.loads(result.stdout)
+        for category in ("broken_links", "source_drift", "orphan_pages"):
+            for name in ("raw/bad.md", "raw/directory.md"):
+                self.assertTrue(any(item["path"] == name and item.get("issue") for item in issues[category]))
+        self.assertTrue(any(item.get("target") == "absent.md" for item in issues["broken_links"]))
+
+    def test_generated_index_title_is_safe_and_index_corruption_is_explicit(self):
+        second_brain.update_index("A\n[evil](https://bad) *title* `code`", "raw/note.md")
+        index = self.root / "index.md"
+        text = index.read_text(encoding="utf-8")
+        tokens = second_brain.MarkdownIt("commonmark").parse(text)
+        links = [child.attrGet("href") for token in tokens if token.children
+                 for child in token.children if child.type == "link_open"]
+        self.assertEqual(links, ["raw/note.md"])
+        self.assertFalse(any(child.type in {"code_inline", "html_inline", "em_open"}
+                             for token in tokens if token.children for child in token.children))
+        self.assertNotIn("\n[evil]", text)
+        index.write_bytes(b"# Index\n\xff")
+        source = self.root / "source.txt"
+        source.write_text("text", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "index.md.*UTF-8"):
+            second_brain.ingest(str(source))
+        self.assertEqual(index.read_bytes(), b"# Index\n\xff")
+        self.assertEqual(list(self.raw.rglob("*.md")), [])
+        self.assertFalse((self.root / "log.md").exists())
+
+    def test_url_control_characters_cannot_inject_index_content(self):
+        with patch.object(second_brain, "fetch_url", return_value=(b"note", "text/plain")):
+            result = second_brain.ingest("https://example.com/normal%0A%5Bevil%5D%28bad%29.txt")
+        index = (self.root / "index.md").read_text(encoding="utf-8")
+        children = [child for token in second_brain.MarkdownIt("commonmark").parse(index)
+                    if token.children for child in token.children]
+        self.assertEqual([child.attrGet("href") for child in children if child.type == "link_open"],
+                         [result["raw"]])
+        self.assertNotIn("\n[evil]", index)
+
     def test_queries_are_logged_once_with_and_without_saved_output(self):
         env = os.environ.copy()
         env["SECOND_BRAIN_ROOT"] = str(self.root)

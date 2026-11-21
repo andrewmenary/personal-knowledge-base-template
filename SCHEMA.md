@@ -147,6 +147,8 @@ Lint broken GFM links, orphan wiki pages, missing raw sources, source hash drift
 
 Link lint checks inline links, images, and defined reference links; it reports undefined full and collapsed references and possible undefined shortcut references. Undefined shortcuts are indistinguishable from ordinary bracketed prose in Markdown, so those reports may require human review. Escape literal brackets to avoid such warnings.
 
+Unreadable, missing, changed-type, and invalid UTF-8 files produce per-file lint issues rather than aborting the scan. Orphan results can be incomplete when files could not be read. Generated index labels escape Markdown syntax and remove control characters. Index updates reject invalid UTF-8 without changing the existing bytes; repair the index before retrying.
+
 ## Implementation decisions
 
 - Python, PyYAML, markdown-it-py, and filelock are required for tooling, YAML validation, Markdown link parsing, and concurrent writes.

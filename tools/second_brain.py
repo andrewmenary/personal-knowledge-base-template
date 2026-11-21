@@ -12,6 +12,8 @@ import sys
 import os
 import tempfile
 import uuid
+import string
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
@@ -173,6 +175,7 @@ def repository_lock(name: str) -> FileLock:
 
 def ingest(source: str, journal: bool = False) -> dict[str, str]:
     with repository_lock("content"), repository_lock("index"), repository_lock("log"):
+        read_index()
         created = []
         snapshots = {}
         try:
@@ -318,10 +321,21 @@ def update_index(title: str, relative_source: str):
         _update_index(title, relative_source, "## Raw sources")
 
 
+def read_index() -> str:
+    try:
+        return INDEX.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "# Knowledge Index\n"
+    except UnicodeDecodeError as exc:
+        raise ValueError("index.md is not valid UTF-8; repair it before updating the index") from exc
+
+
 def _update_index(title: str, relative_source: str, section: str):
-    text = INDEX.read_text(encoding="utf-8") if INDEX.exists() else "# Knowledge Index\n"
+    text = read_index()
     target = quote(relative_source, safe="/-._~")
-    escaped_title = re.sub(r"([\\\[\]])", r"\\\1", title)
+    safe_title = "".join(" " if unicodedata.category(char).startswith("C") else char for char in title)
+    safe_title = " ".join(safe_title.split()) or "Untitled"
+    escaped_title = "".join("\\" + char if char in string.punctuation else char for char in safe_title)
     link = f"- [{escaped_title}]({target})"
     tokens = MarkdownIt("commonmark").parse(text)
     section_start = None
@@ -888,19 +902,36 @@ def local_link_target(path: Path, target: str) -> Path | None:
     return (path.parent / unquote(parsed.path)).resolve()
 
 
+def read_lint_markdown(path: Path, issues: list[dict[str, str]]) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        issues.append({"path": path.relative_to(ROOT).as_posix(), "issue": f"cannot read Markdown: {exc}"})
+        return None
+
+
 def lint_links() -> list[dict[str, str]]:
     issues = []
     for path in sorted(ROOT.rglob("*.md")):
         if ".git" in path.parts:
             continue
-        for line, target, undefined in markdown_links(path.read_text(encoding="utf-8", errors="replace")):
+        text = read_lint_markdown(path, issues)
+        if text is None:
+            continue
+        for line, target, undefined in markdown_links(text):
             if undefined:
                 issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line),
                                "target": target, "issue": "undefined reference"})
             else:
-                resolved = local_link_target(path, target)
-                if resolved is not None and not resolved.exists():
+                try:
+                    resolved = local_link_target(path, target)
+                    if resolved is not None:
+                        resolved.stat()
+                except FileNotFoundError:
                     issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line), "target": target})
+                except (OSError, ValueError, RuntimeError) as exc:
+                    issues.append({"path": path.relative_to(ROOT).as_posix(), "line": str(line),
+                                   "target": target, "issue": f"cannot inspect link: {exc}"})
     return issues
 
 
@@ -908,9 +939,12 @@ def lint_source_drift(check_urls: bool = False) -> list[dict[str, str]]:
     issues = []
     for path in sorted(RAW.rglob("*.md")):
         relative = path.relative_to(ROOT).as_posix()
+        text = read_lint_markdown(path, issues)
+        if text is None:
+            continue
         try:
-            meta = parse_front_matter(path.read_text(encoding="utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
+            meta = parse_front_matter(text)
+        except ValueError as exc:
             issues.append({"path": relative, "issue": str(exc)})
             continue
         for field in ("title", "source", "source_type", "status"):
@@ -958,33 +992,49 @@ def lint_source_drift(check_urls: bool = False) -> list[dict[str, str]]:
                 except Exception as exc:
                     issues.append({"path": path.relative_to(ROOT).as_posix(), "source": source, "issue": str(exc)})
         else:
-            source_path = Path(source).expanduser()
-            if not source_path.is_absolute():
-                source_path = (ROOT / source).resolve()
-            if not source_path.exists():
-                issues.append({"path": path.relative_to(ROOT).as_posix(), "source": source, "issue": "missing"})
-            elif hashlib.sha256(source_path.read_bytes()).hexdigest() != expected:
-                issues.append({"path": path.relative_to(ROOT).as_posix(), "source": source, "issue": "changed"})
+            try:
+                source_path = Path(source).expanduser()
+                if not source_path.is_absolute():
+                    source_path = (ROOT / source).resolve()
+                if hashlib.sha256(source_path.read_bytes()).hexdigest() != expected:
+                    issues.append({"path": relative, "source": source, "issue": "changed"})
+            except FileNotFoundError:
+                issues.append({"path": relative, "source": source, "issue": "missing"})
+            except (OSError, ValueError, RuntimeError) as exc:
+                issues.append({"path": relative, "source": source, "issue": f"cannot read source: {exc}"})
     return issues
 
 
 def lint_orphans() -> list[dict[str, str]]:
+    issues = []
     output_dir = (WIKI / "output").resolve()
-    pages = {
-        path.resolve()
-        for path in WIKI.rglob("*.md")
-        if output_dir not in path.resolve().parents
-    }
+    pages = {}
+    for path in WIKI.rglob("*.md"):
+        try:
+            resolved = path.resolve()
+            if output_dir not in resolved.parents:
+                pages[resolved] = path
+        except (OSError, RuntimeError) as exc:
+            issues.append({"path": path.relative_to(ROOT).as_posix(), "issue": f"cannot inspect page: {exc}"})
     linked = set()
     for path in sorted(ROOT.rglob("*.md")):
         if ".git" in path.parts:
             continue
-        for _, target, undefined in markdown_links(path.read_text(encoding="utf-8", errors="replace")):
+        text = read_lint_markdown(path, issues)
+        if text is None:
+            continue
+        for _, target, undefined in markdown_links(text):
             if not undefined:
-                resolved = local_link_target(path, target)
-                if resolved is not None:
-                    linked.add(resolved)
-    return [{"path": path.relative_to(ROOT).as_posix()} for path in sorted(pages) if path not in linked and path.name != "README.md"]
+                try:
+                    resolved = local_link_target(path, target)
+                    if resolved is not None:
+                        linked.add(resolved)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    issues.append({"path": path.relative_to(ROOT).as_posix(), "target": target,
+                                   "issue": f"cannot inspect link: {exc}"})
+    issues.extend({"path": pages[path].relative_to(ROOT).as_posix()} for path in sorted(pages)
+                  if path not in linked and pages[path].name != "README.md")
+    return issues
 
 
 def save_query_output(terms: str, matches: list[dict[str, str]]) -> Path:
