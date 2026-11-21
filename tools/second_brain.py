@@ -317,15 +317,17 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
             calendar_date.fromisoformat(date)
         except ValueError:
             raise ValueError("scheduled tasks require a valid date in YYYY-MM-DD format") from None
-    needle = task.strip().lower()
-    changed = []
+    def normalized(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    needle = normalized(task)
+    if not needle:
+        raise ValueError("task must not be empty")
     candidates = []
     candidates.extend(RAW.rglob("*.md"))
     candidates.extend((WIKI / "collections").rglob("*.md"))
-    canonical_updated = False
+    matches = []
     for path in sorted(set(candidates)):
-        if canonical_updated:
-            break
         if path.resolve() == LOG.resolve():
             continue
         if not (path.resolve().is_relative_to(RAW.resolve()) or
@@ -343,18 +345,26 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
                 continue
             body_start = text.splitlines().index("---", 1) + 1
         lines = text.splitlines(keepends=True)
-        output = []
+        protected = set()
+        for token in MarkdownIt("commonmark").parse(text):
+            if token.type in {"fence", "html_block"} and token.map:
+                protected.update(range(*token.map))
         for line_number, original_line in enumerate(lines):
-            if line_number < body_start:
-                output.append(original_line)
+            if line_number < body_start or line_number in protected:
                 continue
             line = original_line.rstrip("\r\n")
             ending = original_line[len(line):]
             parsed = parse_bullet(line)
-            if not canonical_updated and needle and parsed["bullet"] in {" ", "+", ">", "<", "X", "x"} and needle in str(parsed["text"]).lower():
+            description = str(parsed["text"])
+            if not path.is_relative_to(RAW):
+                description = re.sub(r"(?:\s+\(\[source\]\([^)]+\)\))+$", "", description)
+            if parsed["bullet"] == "<":
+                description = re.sub(r"^\d{4}-\d{2}-\d{2}(?:[ \t]+|$)", "", description)
+            if parsed["bullet"] == ">":
+                description = re.sub(r"\s+->\s+.*$", "", description)
+            if parsed["bullet"] in {" ", "+", ">", "<", "X", "x"} and needle == normalized(description):
                 match = re.match(r"^([ \t]*(?:[*=!^][ \t]*)*)(\[[ Xx><]\]|[+Xx><])", line)
                 if match is None:
-                    output.append(original_line)
                     continue
                 marker = f"[{symbol if symbol != '+' else ' '}]" if match.group(2).startswith("[") else symbol
                 replacement = match.group(1) + marker + line[match.end():]
@@ -365,15 +375,17 @@ def migrate_task(task: str, status: str, target: str | None = None, date: str | 
                     replacement = match.group(1) + marker + " " + date + remainder
                 elif status == "migrated" and target:
                     replacement += f" -> {target}"
-                output.append(replacement + ending)
-                changed.append(path.relative_to(ROOT).as_posix())
-                canonical_updated = True
-            else:
-                output.append(original_line)
-        new_text = "".join(output)
-        if new_text != text:
-            with path.open("w", encoding="utf-8", newline="") as handle:
-                handle.write(new_text)
+                matches.append((path, lines, line_number, replacement + ending))
+    if len(matches) > 1:
+        locations = ", ".join(f"{path.relative_to(ROOT).as_posix()}:{number + 1}" for path, _, number, _ in matches)
+        raise ValueError(f"ambiguous task; multiple exact matches: {locations}")
+    changed = []
+    if matches:
+        path, lines, line_number, replacement = matches[0]
+        lines[line_number] = replacement
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write("".join(lines))
+        changed.append(path.relative_to(ROOT).as_posix())
     append_log("migration", task, f"status={status}; target={target or ''}")
     return sorted(set(changed))
 
@@ -447,25 +459,31 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
     resolved_source = source.resolve()
     if not resolved_source.is_relative_to(ROOT.resolve()):
         raise ValueError(f"Collection source must be inside the knowledge base: {source}")
-    parser = MarkdownIt("commonmark", {"inline_definitions": True})
-    definitions = set()
-    for token in parser.parse(text):
-        if token.type == "definition" and token.map:
-            definitions.update(range(*token.map))
+    parser = MarkdownIt("commonmark", {"inline_definitions": True}).enable("table")
+    tokens = parser.parse(text)
+    source_lines = text.splitlines()
+    protected = set()
+    for token in tokens:
+        if token.type in {"fence", "code_block", "html_block"} and token.map:
+            protected.update(range(*token.map))
     collections: dict[str, list[str]] = {}
     current = None
-    for line_number, line in enumerate(text.splitlines()):
-        if line_number in definitions:
+    for token in tokens:
+        if token.type == "heading_open" and token.level == 0:
+            heading = COLLECTION_HEADINGS.match(source_lines[token.map[0]])
+            current = slugify(heading.group(1)) if heading else None
+            if current:
+                collections.setdefault(current, [])
             continue
-        heading = COLLECTION_HEADINGS.match(line)
-        if heading:
-            current = slugify(heading.group(1))
-            collections.setdefault(current, [])
-        elif current:
-            if re.match(r"^#{1,6}\s+", line):
-                current = None
-            elif line.strip():
-                collections[current].append(line)
+        if not current or not token.map:
+            continue
+        is_item = token.type == "list_item_open" and token.level == 1
+        is_block = token.level == 0 and token.type in {
+            "paragraph_open", "fence", "code_block", "blockquote_open", "table_open", "html_block"
+        }
+        if is_item or is_block:
+            start, end = token.map
+            collections[current].append((start, end))
 
     results = []
     for name, entries in collections.items():
@@ -474,11 +492,20 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
         existing = destination.read_text(encoding="utf-8") if destination.exists() else f"# {name.replace('-', ' ').title()}\n"
         source_relative = resolved_source.relative_to(ROOT.resolve()).as_posix()
         source_annotation = f"([source](../../{quote(source_relative, safe='/')}))"
+        block_pattern = re.compile(
+            r"(?ms)^<!-- collection-entry:([0-9a-f]{64}) -->\n(.*?)\n"
+            r"((?:\(\[source\]\([^)]+\)\)(?: |\n|$))+)\n<!-- /collection-entry -->"
+        )
+        blocks = {}
+        def remember_block(match):
+            blocks[match.group(1)] = [match.group(2).rstrip("\n"), match.group(3).strip()]
+            return ""
+        existing_without_blocks = block_pattern.sub(remember_block, existing)
         lines = []
         provenance = re.compile(r"(?:\s+\(\[source\]\([^)]+\)\))+$")
         annotation = re.compile(r"\(\[source\]\([^)]+\)\)")
         identities = {}
-        for line in existing.splitlines():
+        for line in existing_without_blocks.splitlines():
             identity = provenance.sub("", line).strip()
             if identity and not identity.startswith("#"):
                 if identity in identities:
@@ -489,9 +516,22 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
                     continue
                 identities[identity] = len(lines)
             lines.append(line)
-        for entry in entries:
-            entry = rebase_markdown(entry, resolved_source, destination, text)
+        for start, end in entries:
+            entry = "\n".join(
+                source_lines[line] if line in protected else
+                rebase_markdown(source_lines[line], resolved_source, destination, text)
+                for line in range(start, end)
+            ).strip("\n")
             identity = entry.strip()
+            if not identity:
+                continue
+            if "\n" in identity:
+                digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                if digest not in blocks:
+                    blocks[digest] = [entry, source_annotation]
+                elif source_annotation not in blocks[digest][1]:
+                    blocks[digest][1] += " " + source_annotation
+                continue
             if identity in identities:
                 index = identities[identity]
                 if source_annotation not in lines[index]:
@@ -499,7 +539,10 @@ def extract_collections(source: Path) -> list[dict[str, str]]:
             else:
                 identities[identity] = len(lines)
                 lines.append(f"{entry} {source_annotation}")
-        updated = gfm("\n".join(lines))
+        updated = "\n".join(lines).strip()
+        for digest, (entry, sources) in blocks.items():
+            updated += f"\n\n<!-- collection-entry:{digest} -->\n{entry}\n\n{sources}\n<!-- /collection-entry -->"
+        updated += "\n"
         if updated != existing:
             destination.write_text(updated, encoding="utf-8")
         update_collection_index(name, destination)
@@ -534,29 +577,55 @@ def query_terms(terms: str) -> list[dict[str, str]]:
 
 
 def markdown_links(text: str):
-    """Yield parsed links and explicit unresolved references with their block line."""
+    """Yield parsed links and suspected unresolved references with their block line."""
     parser = MarkdownIt("commonmark")
     environment = {}
     tokens = parser.parse(text, environment)
-    unresolved = re.compile(r"(?<!\\)!?\[([^\[\]\n]+)\]\[([^\[\]\n]*)\]")
+    missing = []
+    for name, rule in (("link", link_rule), ("image", image_rule)):
+        def find_missing(state, silent, rule=rule, name=name):
+            start = state.pos
+            result = rule(state, silent)
+            if result or silent or state.linkLevel:
+                return result
+            if start >= state.posMax or state.src[start] != ("!" if name == "image" else "["):
+                return result
+            if name == "link" and start and state.src[start - 1] == "]":
+                return result
+            label_start = start + (2 if name == "image" else 1)
+            label_end = state.md.helpers.parseLinkLabel(state, start + (name == "image"), name == "link")
+            if label_end < 0:
+                return result
+            label = state.src[label_start:label_end]
+            following = label_end + 1
+            if following < state.posMax and state.src[following] == "(":
+                return result
+            end = following
+            if following < state.posMax and state.src[following] == "[":
+                ref_end = state.md.helpers.parseLinkLabel(state, following)
+                if ref_end >= 0:
+                    label = state.src[following + 1:ref_end] or label
+                    end = ref_end + 1
+            if (label.strip() and label not in {" ", "X", "x", ">", "<"}
+                    and not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", label)):
+                if not any(start < prior_end for _, prior_end in missing):
+                    missing.append((label, end))
+            return result
+
+        parser.inline.ruler.at(name, find_missing)
     for token in tokens:
         if token.type != "inline" or not token.children:
             continue
         line = (token.map[0] + 1) if token.map else 1
-        inside_link = False
+        missing.clear()
+        parser.inline.parse(token.content, parser, environment, [])
+        for label, _ in missing:
+            yield line, label, True
         for child in token.children:
             if child.type == "link_open":
-                inside_link = True
                 yield line, child.attrGet("href"), False
-            elif child.type == "link_close":
-                inside_link = False
             elif child.type == "image":
                 yield line, child.attrGet("src"), False
-            elif child.type == "text" and not inside_link:
-                for match in unresolved.finditer(child.content):
-                    raw = match.group(0)
-                    if any(candidate.group(0) == raw for candidate in unresolved.finditer(token.content)):
-                        yield line, match.group(2) or match.group(1), True
 
 
 def local_link_target(path: Path, target: str) -> Path | None:

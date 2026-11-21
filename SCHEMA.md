@@ -83,11 +83,13 @@ Indented bullets are subtasks. A master task is complete only when all subtasks 
 5. Change date-bound tasks to `< YYYY-MM-DD`; scheduled migrations require a valid calendar date.
 6. Preserve one canonical task record; historical dates may cite it.
 
+The migration CLI matches complete task descriptions case-insensitively with normalized whitespace, excluding scheduling dates, migration destinations, and collection provenance. It refuses ambiguous matches rather than picking one.
+
 ### Collections
 
 Recognize reading lists, habits, shopping lists, goals, meeting notes, project spreads, and other recurring headings. Merge entries by stable identity into `wiki/collections/<slug>.md`. Preserve source links and do not treat collection entries as daily reflections.
 
-For automatic extraction, identity is the entry text after rebasing Markdown destinations to the collection location and removing leading and trailing whitespace, including its Markdown bullet or task marker. Matching entries retain one line with a link for each source.
+For automatic extraction, identity is the entry or complete block after rebasing Markdown destinations to the collection location and removing leading and trailing whitespace, including its Markdown bullet or task marker. Matching entries retain links for each source. Multiline blocks retain their structure with provenance outside the block.
 
 ### OCR cleanup
 
@@ -141,7 +143,7 @@ The routine skills follow `.github/routine-guidance.md` for concise, optional ch
 
 Lint broken GFM links, orphan wiki pages, missing raw sources, source hash drift, and stale front matter. URL drift is opt-in with `--check-urls`.
 
-Link lint checks inline links, images, and defined reference links; it reports undefined full and collapsed references. Undefined shortcut references are plain text in Markdown and are not reported.
+Link lint checks inline links, images, and defined reference links; it reports undefined full and collapsed references and possible undefined shortcut references. Undefined shortcuts are indistinguishable from ordinary bracketed prose in Markdown, so those reports may require human review. Escape literal brackets to avoid such warnings.
 
 ## Implementation decisions
 

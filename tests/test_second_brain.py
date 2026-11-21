@@ -181,7 +181,7 @@ class ReviewRegressionTests(unittest.TestCase):
             with self.subTest(original=original):
                 source = self.raw / "journal.md"
                 source.write_text(JOURNAL_HEADER + original, encoding="utf-8")
-                migrate_task("task", "completed")
+                migrate_task(str(parse_bullet(original)["text"]), "completed")
                 self.assertEqual(source.read_text(encoding="utf-8"), JOURNAL_HEADER + expected)
 
     def test_scheduled_date_validation_before_any_write(self):
@@ -226,6 +226,75 @@ class ReviewRegressionTests(unittest.TestCase):
                 migrate_task("task", "scheduled", date="2026-12-01")
                 self.assertEqual(source.read_text(encoding="utf-8"),
                                  JOURNAL_HEADER + f"  * {marker} 2026-12-01 task\n")
+
+    def test_migration_requires_unique_exact_task(self):
+        source = self.raw / "journal.md"
+        original = JOURNAL_HEADER + "+ Ship fast\n+ Shipments\n+ Ship\n+ ship\n"
+        source.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ambiguous task"):
+            migrate_task(" SHIP ", "completed")
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+        migrate_task("ship fast", "completed")
+        self.assertEqual(source.read_text(encoding="utf-8"), original.replace("+ Ship fast", "X Ship fast"))
+        with self.assertRaisesRegex(ValueError, "ambiguous task"):
+            migrate_task("ship", "completed")
+
+    def test_migration_ignores_fenced_code(self):
+        source = self.raw / "journal.md"
+        original = JOURNAL_HEADER + "```\n+ Ship\n```\n+ Ship fast\n"
+        source.write_text(original, encoding="utf-8")
+        self.assertEqual(migrate_task("Ship", "completed"), [])
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_collection_task_matches_without_provenance(self):
+        collection = self.wiki / "collections" / "tasks.md"
+        collection.parent.mkdir()
+        collection.write_text("+ Ship ([source](../../raw/a.md))\n", encoding="utf-8")
+        self.assertEqual(migrate_task("ship", "completed"), ["wiki/collections/tasks.md"])
+        self.assertEqual(collection.read_text(encoding="utf-8"), "X Ship ([source](../../raw/a.md))\n")
+
+    def test_shortcut_reference_links_and_images(self):
+        target = self.root / "page.md"
+        target.write_text("# Page\n", encoding="utf-8")
+        index = self.root / "index.md"
+        index.write_text(
+            "[  Page  ] ![Pic] [missing] ![lost]\n"
+            "`[code]` \\[escaped] [ ] [X]\n\n"
+            "[page]: page.md\n[pIC]: page.md\n", encoding="utf-8",
+        )
+        issues = lint_links()
+        self.assertEqual({issue["target"] for issue in issues}, {"missing", "lost"})
+
+    def test_collection_preserves_structured_blocks(self):
+        source = self.raw / "blocks.md"
+        source.write_text(
+            "# Reading List\n\n"
+            "```md\n# not a heading\n- [literal](not-a-link.md)  \n```\n\n"
+            "| Name | Item |\n| --- | --- |\n| One | Two |\n\n"
+            "> Quote\n> next line\n\n"
+            "- Parent\n  - Child\n- Separate\n",
+            encoding="utf-8",
+        )
+        extract_collections(source)
+        collection = self.wiki / "collections" / "reading-list.md"
+        result = collection.read_text(encoding="utf-8")
+        for expected in ("```md\n# not a heading\n- [literal](not-a-link.md)  \n```",
+                         "| Name | Item |\n| --- | --- |\n| One | Two |",
+                         "> Quote\n> next line", "- Parent\n  - Child"):
+            self.assertIn(expected, result)
+        from markdown_it import MarkdownIt
+        token_types = [token.type for token in MarkdownIt("commonmark").enable("table").parse(result)]
+        for expected in ("fence", "table_open", "blockquote_open"):
+            self.assertIn(expected, token_types)
+        extract_collections(source)
+        self.assertEqual(collection.read_text(encoding="utf-8"), result)
+        another = self.raw / "another.md"
+        another.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        extract_collections(another)
+        merged = collection.read_text(encoding="utf-8")
+        self.assertEqual(merged.count("```md"), 1)
+        self.assertEqual(merged.count("| Name | Item |"), 1)
+        self.assertIn("([source](../../raw/blocks.md)) ([source](../../raw/another.md))", merged)
 
     def test_migration_only_changes_explicit_journals(self):
         article = self.raw / "a-article.md"
