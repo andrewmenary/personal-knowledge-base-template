@@ -162,9 +162,9 @@ def append_log(operation: str, title: str, detail: str = ""):
 def _append_log(operation: str, title: str, detail: str = ""):
     if not LOG.exists():
         LOG.write_text("# Operations Log\n", encoding="utf-8")
-    suffix = f" - {detail}" if detail else ""
+    suffix = f" - {markdown_safe_text(detail)}" if detail else ""
     with LOG.open("a", encoding="utf-8") as handle:
-        handle.write(f"\n## [{utc_now()}] {operation} | {title}{suffix}\n")
+        handle.write(f"\n## [{utc_now()}] {operation} | {markdown_safe_text(title)}{suffix}\n")
 
 
 def repository_lock(name: str) -> FileLock:
@@ -302,7 +302,7 @@ def _ingest(source: str, journal: bool, created: list[Path], snapshots: dict[Pat
     snapshots[INDEX] = INDEX.read_bytes() if INDEX.exists() else None
     _update_index(title, relative, "## Raw sources")
     snapshots[LOG] = LOG.read_bytes() if LOG.exists() else None
-    _append_log("ingest", title, f"[{relative}]")
+    _append_log("ingest", title, relative)
     return {"title": title, "raw": relative}
 
 
@@ -330,12 +330,16 @@ def read_index() -> str:
         raise ValueError("index.md is not valid UTF-8; repair it before updating the index") from exc
 
 
+def markdown_safe_text(text: str) -> str:
+    safe = "".join(" " if unicodedata.category(char).startswith("C") else char for char in text)
+    safe = " ".join(safe.split()) or "Untitled"
+    return "".join("\\" + char if char in string.punctuation else char for char in safe)
+
+
 def _update_index(title: str, relative_source: str, section: str):
     text = read_index()
     target = quote(relative_source, safe="/-._~")
-    safe_title = "".join(" " if unicodedata.category(char).startswith("C") else char for char in title)
-    safe_title = " ".join(safe_title.split()) or "Untitled"
-    escaped_title = "".join("\\" + char if char in string.punctuation else char for char in safe_title)
+    escaped_title = markdown_safe_text(title)
     link = f"- [{escaped_title}]({target})"
     tokens = MarkdownIt("commonmark").parse(text)
     section_start = None
@@ -837,7 +841,7 @@ def query_terms(terms: str) -> list[dict[str, str]]:
                 continue
             for line in text.splitlines():
                 if any(needle in line.lower() for needle in needles) and not line.startswith("---"):
-                    matches.append({"path": path.relative_to(ROOT).as_posix(), "line": line.strip()[:300]})
+                    matches.append({"path": path.relative_to(ROOT).as_posix(), "line": line[:300]})
                     if len(matches) >= 100:
                         return matches
     return matches
@@ -1041,16 +1045,17 @@ def save_query_output(terms: str, matches: list[dict[str, str]]) -> Path:
     output_dir = WIKI / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{slugify(terms)}-{utc_now()[:10]}.md"
-    lines = [f"# Query: {terms}", "", "## Results", ""]
+    lines = [f"# Query: {markdown_safe_text(terms)}", "", "## Results", ""]
     for item in matches:
         source = ROOT / item["path"]
         target = quote(Path(os.path.relpath(source, destination.parent)).as_posix(), safe="/-._~")
-        label = "source"
-        snippet = rebase_markdown(item["line"], source, destination, source.read_text(encoding="utf-8"))
-        lines.append(f"- [{label}]({target}) - {snippet}")
+        snippet = item["line"]
+        longest = max((len(run) for run in re.findall(r"~+", snippet)), default=0)
+        fence = "~" * max(3, longest + 1)
+        lines.extend([f"- [source]({target})", "", fence, snippet, fence, ""])
     if not matches:
         lines.append("_No matching results._")
-    destination.write_text(gfm("\n".join(lines)), encoding="utf-8")
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return destination
 
 
@@ -1101,7 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
             matches = query_terms(terms)
             if args.save:
                 output = save_query_output(terms, matches)
-                append_log("query", terms, f"[{output.relative_to(ROOT).as_posix()}]")
+                append_log("query", terms, output.relative_to(ROOT).as_posix())
                 print(json.dumps({"output": output.relative_to(ROOT).as_posix(), "matches": matches}, indent=2) if args.json else f"Saved: {output.relative_to(ROOT).as_posix()}")
             elif args.json:
                 append_log("query", terms)

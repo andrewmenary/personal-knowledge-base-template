@@ -131,7 +131,7 @@ Local UTF-8 text and Markdown, and valid non-HTML URL text, are captured without
 
 ### Query
 
-Read `index.md`, search relevant wiki pages, and synthesize answers with source links. Optional output goes to `wiki/output/`. The CLI appends one query operation to `log.md` whether or not output is saved.
+Read `index.md`, search relevant wiki pages, and synthesize answers with source links. Optional output goes to `wiki/output/`. Saved CLI search results contain a source link and a literal fenced excerpt for each matching line, preserving indentation and preventing copied Markdown or HTML from becoming active content. Excerpts are limited to 300 characters; open the source for context. The CLI appends one query operation to `log.md` whether or not output is saved, using escaped plain text for titles and paths.
 
 ### Weekend reminders
 

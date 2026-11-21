@@ -799,7 +799,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("<div>\n[literal](book.md)\n</div>", result)
         self.assertEqual(result.count("([source](../../raw/reading.md))"), 2)
 
-    def test_saved_query_escapes_paths_and_rebases_snippets(self):
+    def test_saved_query_escapes_paths_and_preserves_literal_snippets(self):
         source = self.wiki / "note (#one).md"
         target = self.wiki / "linked file.md"
         target.write_text("# Linked\n", encoding="utf-8")
@@ -807,8 +807,45 @@ class ReviewRegressionTests(unittest.TestCase):
         output = save_query_output("example", [{"path": "wiki/note (#one).md", "line": "[link][ref] ![img](<linked file.md#part>)"}])
         text = output.read_text(encoding="utf-8")
         self.assertIn("../note%20%28%23one%29.md", text)
-        self.assertIn("[link](../linked%20file.md)", text)
-        self.assertIn("![img](../linked%20file.md#part)", text)
+        self.assertIn("[link][ref] ![img](<linked file.md#part>)", text)
+        self.assertFalse([issue for issue in lint_links() if issue["path"] == output.relative_to(self.root).as_posix()])
+
+    def test_ingest_and_saved_query_do_not_add_log_link_lint_issues(self):
+        source = self.root / "sample.txt"
+        source.write_text("topic\n", encoding="utf-8")
+        second_brain.ingest(str(source))
+        env = os.environ.copy()
+        env["SECOND_BRAIN_ROOT"] = str(self.root)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "second_brain.py"), "query", "topic", "--save"],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lint_links(), [])
+
+    def test_log_user_text_cannot_inject_markdown_or_lines(self):
+        second_brain.append_log("query", "[topic]\n# forged", "[report](missing.md)")
+        log = (self.root / "log.md").read_text(encoding="utf-8")
+        self.assertNotIn("\n# forged", log)
+        self.assertEqual([issue for issue in lint_links() if issue["path"] == "log.md"], [])
+
+    def test_saved_query_renders_markdown_snippets_as_literal_blocks(self):
+        source = self.wiki / "snippets.md"
+        source.write_text(
+            "```md\n  [needle](missing.md)  \n```\n\n"
+            "| needle | [link](missing.md) |\n| --- | --- |\n\n"
+            "# needle heading\n\n> needle quote\n\n<div>needle [bad](missing.md)</div>\n"
+            "\n~~~ needle fence\n", encoding="utf-8")
+        matches = [item for item in second_brain.query_terms("needle") if item["path"] == "wiki/snippets.md"]
+        output = save_query_output("needle", matches)
+        text = output.read_text(encoding="utf-8")
+        tokens = second_brain.MarkdownIt("commonmark").enable("table").parse(text)
+        fenced = [token.content for token in tokens if token.type == "fence"]
+        self.assertEqual(fenced, [item["line"] + "\n" for item in matches])
+        self.assertIn("  [needle](missing.md)  ", fenced[0])
+        links = [child.attrGet("href") for token in tokens if token.children
+                 for child in token.children if child.type == "link_open"]
+        self.assertEqual(links, ["../snippets.md"] * len(matches))
         self.assertFalse([issue for issue in lint_links() if issue["path"] == output.relative_to(self.root).as_posix()])
 
     def test_lint_reports_missing_or_malformed_source_metadata(self):

@@ -17,3 +17,5 @@ Chronological append-only operation history.
 ## [2026-11-21T08:23:21Z] maintenance | Enforce task hierarchy and protect ingest integrity
 
 ## [2026-11-21T08:38:15Z] maintenance | Harden lint scans and index labels
+
+## [2026-11-21T08:49:47Z] maintenance | Preserve search excerpts and lint-safe operation logs
