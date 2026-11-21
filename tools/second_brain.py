@@ -256,13 +256,11 @@ def ingest(source: str, journal: bool = False) -> dict[str, str]:
         except FileExistsError:
             sequence += 1
             continue
-        if not is_url and path.suffix.lower() in {".md", ".markdown"}:
-            rendered_body = rebase_markdown(rendered_body, path, destination, rendered_body)
-            content = front_matter(title, source, source_type, sha, journal) + "\n\n" + rendered_body
-        else:
-            content = front_matter(title, source, source_type, sha, journal) + "\n\n" + rendered_body
         try:
             with handle:
+                if not is_url and path.suffix.lower() in {".md", ".markdown"}:
+                    rendered_body = rebase_markdown(rendered_body, path, destination, rendered_body)
+                content = front_matter(title, source, source_type, sha, journal) + "\n\n" + rendered_body
                 handle.write(content)
         except BaseException:
             destination.unlink(missing_ok=True)

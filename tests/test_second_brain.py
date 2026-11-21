@@ -438,6 +438,16 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("  + preserve indentation  \n\n[Sibling](../../sibling.md)\n![Image](../../images/pixel.png)", raw)
         self.assertNotIn("trimmed", raw)
 
+    def test_ingest_rebase_failure_closes_and_removes_reserved_capture(self):
+        source = self.root / "source.md"
+        source.write_text("[link](note.md)\n", encoding="utf-8")
+        with patch.object(second_brain, "rebase_markdown", side_effect=ValueError("cannot rebase")):
+            with self.assertRaisesRegex(ValueError, "cannot rebase"):
+                second_brain.ingest(str(source))
+        self.assertEqual(list(self.raw.rglob("*.md")), [])
+        self.assertFalse((self.root / "index.md").exists())
+        self.assertFalse((self.root / "log.md").exists())
+
     def test_markdown_ingest_preserves_links_in_code_and_html(self):
         source = self.root / "blocks.md"
         source.write_text(
