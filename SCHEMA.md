@@ -126,6 +126,10 @@ Without a successful conversion, local text fallback accepts extensionless files
 
 Read `index.md`, search relevant wiki pages, and synthesize answers with source links. Optional output goes to `wiki/output/`. The CLI appends one query operation to `log.md` whether or not output is saved.
 
+### Weekend reminders
+
+The `weekend-reminders` skill provides a Friday preview and a first-workday check-in, using configured workdays and known holidays without assuming calendar completeness. Scheduling and delivery are host responsibilities; prompts do not guarantee notifications or automatic snoozes. Preserve raw sources and canonical task statuses when preparing or deferring a reminder.
+
 ### Lint
 
 Lint broken GFM links, orphan wiki pages, missing raw sources, source hash drift, and stale front matter. URL drift is opt-in with `--check-urls`.

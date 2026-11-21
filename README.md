@@ -41,6 +41,17 @@ Open this repository in a Copilot agent session and ask naturally. Copilot can s
 
 You can also request `/ingest`, `/query`, `/lint`, or `/log` by name in your prompt. Skills guide Copilot through the work; they do not hide tool activity or automatically perform OCR. If the skills are not available in a current Copilot CLI session, restart it or use `/skills reload`. For a new journal capture, the `/log` skill keeps its original in the Git-ignored `inbox/`; removing that original can produce a source-drift warning.
 
+### Weekend reminders
+
+Ask Copilot to use `/weekend-reminders`, or use these prompts with a scheduling host that supports them:
+
+- **Friday at 4 PM, local time:** "Give me my Friday weekend preview using `/weekend-reminders`."
+- **Weekdays at 8 AM, local time:** "Give me my first-workday reminder using `/weekend-reminders`; skip other days."
+
+Provide your time zone, usual workdays, holidays or days off, and an authorized calendar if available. The Friday preview checks Monday and Tuesday and looks further ahead after a known long weekend; the morning check-in focuses on the first workday. Both include relevant unfinished tasks and one next action. You can ask to snooze or defer to a specific time; automatic snoozing requires a host that confirms it can schedule the follow-up.
+
+These are reusable prompts, not preconfigured automations. Configure the schedules in your chosen host and check its delivery behavior. A host may only wake an active app session, so an 8 AM notification is **not guaranteed** if you log in later. Use a host that queues or retries missed runs at next login, or ask for the check-in manually. If delivery cannot be verified, a retry may repeat a reminder.
+
 ## Manual CLI
 
 Install the required YAML and Markdown parsers and optional MarkItDown conversion support:
